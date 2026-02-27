@@ -71,7 +71,15 @@ class UnifiedEmbedder:
     This wrapper normalizes usage to ``embedder(sequence)``.
     """
 
-    def __init__(self, embedder_type: str, **kwargs):
+    def __init__(
+        self,
+        embedder_type: str,
+        model_name_or_path: str,
+        device: str = "cuda",
+        pooling: str = "mean",
+        local_files_only: bool = True,
+        **kwargs,
+    ):
         """Create a unified embedder instance.
 
         Parameters
@@ -81,7 +89,14 @@ class UnifiedEmbedder:
         **kwargs
             Forwarded to the concrete embedder constructor.
         """
-        self.embedder = load_pretrained(embedder_type, **kwargs)
+        init_kwargs = {
+            "model_name_or_path": model_name_or_path,
+            "device": device,
+            "pooling": pooling,
+            "local_files_only": local_files_only,
+        }
+        init_kwargs.update(kwargs)
+        self.embedder = load_pretrained(embedder_type, **init_kwargs)
         self.embedder_type = embedder_type
 
     def __call__(self, sequence: str | List[str]):
@@ -913,10 +928,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-save_file", dest="save_file", action="store_false")
 
     p.add_argument("--model_name_or_path", default=None, help="When set, build UnifiedEmbedder automatically")
+    p.add_argument("--embedder_type", default="rice8k", help="Embedder type, e.g. rice8k/generator/agront/evo2/nt")
     p.add_argument("--device", default="cuda")
     p.add_argument("--torch_dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     p.add_argument("--use_flash_attention", action="store_true", default=False)
     p.add_argument("--pooling", default="mean")
+    p.add_argument("--local_files_only", action="store_true", default=True)
+    p.add_argument("--allow_remote", dest="local_files_only", action="store_false")
+    p.add_argument(
+        "--embedder_kwargs",
+        default="{}",
+        help="JSON dict for embedder-specific kwargs, e.g. '{\"layer_name\":\"blocks.20.mlp.l3\"}'",
+    )
 
     return p
 
@@ -937,13 +960,32 @@ def build_embedder_from_args(args):
         "float32": torch.float32,
     }
 
+    extra_kwargs = json.loads(args.embedder_kwargs) if args.embedder_kwargs else {}
+    if not isinstance(extra_kwargs, dict):
+        raise ValueError("--embedder_kwargs must be a JSON object string")
+
+    # Normalize torch_dtype if provided via embedder_kwargs.
+    if isinstance(extra_kwargs.get("torch_dtype"), str):
+        td = extra_kwargs["torch_dtype"].lower()
+        if td in dtype_map:
+            extra_kwargs["torch_dtype"] = dtype_map[td]
+
+    base_kwargs = {
+        "local_files_only": args.local_files_only,
+        "pooling": args.pooling,
+    }
+    # Keep existing rice defaults for backward compatibility.
+    if args.embedder_type.lower() == "rice8k":
+        base_kwargs["torch_dtype"] = dtype_map[args.torch_dtype]
+        base_kwargs["use_flash_attention"] = args.use_flash_attention
+
+    base_kwargs.update(extra_kwargs)
+
     embedder = UnifiedEmbedder(
-        "rice8k",
+        args.embedder_type,
         model_name_or_path=args.model_name_or_path,
         device=args.device,
-        torch_dtype=dtype_map[args.torch_dtype],
-        use_flash_attention=args.use_flash_attention,
-        pooling=args.pooling,
+        **base_kwargs,
     )
     return embedder
 

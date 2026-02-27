@@ -219,3 +219,7 @@ __marimo__/
 Thumbs.db
 test_outputs/
 test_inputs/
+
+*.csv
+
+*.ipynb

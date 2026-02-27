@@ -50,16 +50,27 @@ def _require_evo2() -> None:
         ) from _EVO2_ERROR
 
 
+def _resolve_model_path(model_name_or_path: str | None) -> str:
+    if model_name_or_path:
+        return model_name_or_path
+    raise ValueError("model_name_or_path is required.")
+
+
+def _raise_on_unused_kwargs(kwargs: dict, cls_name: str) -> None:
+    if kwargs:
+        raise ValueError(f"{cls_name} got unsupported kwargs: {sorted(kwargs.keys())}")
+
+
 class GENERatorEmbedder:
     """Use GENERator (causal LM) to embed DNA sequences."""
 
     def __init__(
         self,
-        model_dir: str | None = None,
-        model_version: str = "GENERator-eukaryote-1.2b-base",
-        model_name_or_path: str | None = None,
-        device: str = "cpu",
-        pooling: str = "last",
+        model_name_or_path: str,
+        device: str = "cuda",
+        pooling: str = "mean",
+        local_files_only: bool = True,
+        **kwargs,
     ):
         """
         pooling:
@@ -71,26 +82,19 @@ class GENERatorEmbedder:
             raise ValueError("pooling must be 'last' or 'mean'")
         self.pooling = pooling
 
-        if model_name_or_path:
-            model_path = model_name_or_path
-            verify_local = False
-        elif model_dir:
-            model_path = os.path.join(model_dir, model_version)
-            verify_local = True
-        else:
-            raise ValueError("Provide model_name_or_path or model_dir + model_version.")
+        model_path = _resolve_model_path(model_name_or_path)
         self.device = device
-
-        if verify_local and not os.path.exists(model_path):
-            raise ValueError(
-                "Model or tokenizer path does not exist. "
-                "If using a remote repo, pass model_name_or_path."
-            )
+        _raise_on_unused_kwargs(kwargs, "GENERatorEmbedder")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path, trust_remote_code=True
+            model_path,
+            trust_remote_code=True,
+            local_files_only=local_files_only,
         )
-        self.model = AutoModelForCausalLM.from_pretrained(model_path).to(self.device)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+        ).to(self.device)
         self.model.eval()
         self.max_length = self.model.config.max_position_embeddings
 
@@ -147,11 +151,11 @@ class Evo2Embedder:
 
     def __init__(
         self,
-        model_dir: str | None = None,
-        model_version: str = "evo2_7b",
-        model_name_or_path: str | None = None,
-        device: str = "cpu",
-        pooling: str = "last",
+        model_name_or_path: str,
+        device: str = "cuda",
+        pooling: str = "mean",
+        local_files_only: bool = True,
+        **kwargs,
     ):
         """
         pooling:
@@ -164,12 +168,17 @@ class Evo2Embedder:
         self.pooling = pooling
         self.device = device
 
-        if model_name_or_path:
-            model_path = model_name_or_path
-        elif model_dir:
-            model_path = os.path.join(model_dir, model_version)
-        else:
-            raise ValueError("Provide model_name_or_path or model_dir + model_version.")
+        _ = local_files_only
+        self.layer_name = kwargs.get("layer_name", None)
+        if self.layer_name is None:
+            self.layer_name = "blocks.28.mlp.l3"
+        kwargs.pop("layer_name", None)
+        model_version = kwargs.get("model_version", None)
+        kwargs.pop("model_version", None)
+        model_path = _resolve_model_path(model_name_or_path)
+        if model_version is None:
+            model_version = os.path.basename(model_path)
+        _raise_on_unused_kwargs(kwargs, "Evo2Embedder")
         if not os.path.exists(model_path):
             raise ValueError(
                 f"{model_version} model path does not exist. "
@@ -182,7 +191,7 @@ class Evo2Embedder:
 
         self.model = Evo2(model_version, local_path=model_file)
 
-    def embed(self, sequence: str, layer_name: str = "blocks.28.mlp.l3") -> np.ndarray:
+    def embed(self, sequence: str) -> np.ndarray:
         token_ids = (
             torch.tensor(self.model.tokenizer.tokenize(sequence), dtype=torch.int)
             .unsqueeze(0)
@@ -191,10 +200,10 @@ class Evo2Embedder:
 
         with torch.no_grad():
             _, outputs = self.model(
-                token_ids, return_embeddings=True, layer_names=[layer_name]
+                token_ids, return_embeddings=True, layer_names=[self.layer_name]
             )
 
-        hidden = outputs[layer_name]  # (B, L, C)
+        hidden = outputs[self.layer_name]  # (B, L, C)
         if self.pooling == "last":
             emb = hidden[0, -1, :]
         else:
@@ -208,36 +217,30 @@ class NucleotideTransformerEmbedder:
 
     def __init__(
         self,
-        model_dir: str | None = None,
-        model_version: str = "nucleotide-transformer-2.5b-multi-species",
-        model_name_or_path: str | None = None,
-        device: str = "cpu",
+        model_name_or_path: str,
+        device: str = "cuda",
         pooling: str = "mean",
+        local_files_only: bool = True,
+        **kwargs,
     ):
         _require_transformers()
         if pooling not in {"last", "mean"}:
             raise ValueError("pooling must be 'last' or 'mean'")
         self.pooling = pooling
 
-        if model_name_or_path:
-            model_path = model_name_or_path
-            verify_local = False
-        elif model_dir:
-            model_path = os.path.join(model_dir, model_version)
-            verify_local = True
-        else:
-            raise ValueError("Provide model_name_or_path or model_dir + model_version.")
+        model_path = _resolve_model_path(model_name_or_path)
         self.device = device
+        _raise_on_unused_kwargs(kwargs, "NucleotideTransformerEmbedder")
 
-        if verify_local and not os.path.exists(model_path):
-            raise ValueError(
-                "Model or tokenizer path does not exist. "
-                "If using a remote repo, pass model_name_or_path."
-            )
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+        )
         self.max_length = self.tokenizer.model_max_length
-        self.model = AutoModelForMaskedLM.from_pretrained(model_path).to(self.device)
+        self.model = AutoModelForMaskedLM.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+        ).to(self.device)
         self.model.eval()
 
     def embed(self, sequence: str) -> np.ndarray:
@@ -279,39 +282,27 @@ class AgrontEmbedder:
 
     def __init__(
         self,
-        model_dir: str | None = None,
-        model_version: str = "agro-nucleotide-transformer-1b",
-        model_name_or_path: str | None = None,
-        device: str = "cpu",
-        pooling: str = "last",
+        model_name_or_path: str,
+        device: str = "cuda",
+        pooling: str = "mean",
+        local_files_only: bool = True,
+        **kwargs,
     ):
         _require_transformers()
         if pooling not in {"last", "mean"}:
             raise ValueError("pooling must be 'last' or 'mean'")
         self.pooling = pooling
 
-        if model_name_or_path:
-            model_path = model_name_or_path
-            verify_local = False
-        elif model_dir:
-            model_path = os.path.join(model_dir, model_version)
-            verify_local = True
-        else:
-            raise ValueError("Provide model_name_or_path or model_dir + model_version.")
+        model_path = _resolve_model_path(model_name_or_path)
         self.device = device
-
-        if verify_local and not os.path.exists(model_path):
-            raise ValueError(
-                "Model or tokenizer path does not exist. "
-                "If using a remote repo, pass model_name_or_path."
-            )
+        _raise_on_unused_kwargs(kwargs, "AgrontEmbedder")
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            model_path, local_files_only=True
+            model_path, local_files_only=local_files_only
         )
         self.max_length = self.tokenizer.model_max_length
         self.model = AutoModelForMaskedLM.from_pretrained(
-            model_path, local_files_only=True
+            model_path, local_files_only=local_files_only
         ).to(self.device)
         self.model.eval()
 
@@ -326,7 +317,8 @@ class AgrontEmbedder:
             truncation=True,
             max_length=self.max_length,
         )["input_ids"].to(self.device)
-        torch_batch_tokens = torch.tensor(tokens_ids)
+        # torch_batch_tokens = torch.tensor(tokens_ids)
+        torch_batch_tokens = tokens_ids.clone()
         attention_mask = torch_batch_tokens != self.tokenizer.pad_token_id
 
         with torch.no_grad():
@@ -359,56 +351,48 @@ class Rice8kEmbedder:
 
     def __init__(
         self,
-        model_dir: str | None = None,
-        model_version: str = "rice_1B_stage2_8k_hf",
-        model_name_or_path: str | None = None,
+        model_name_or_path: str,
         device: str = "cuda",
-        pooling: str = "last",
-        use_flash_attention: bool = True,
-        torch_dtype=None,
+        pooling: str = "mean",
+        local_files_only: bool = True,
+        **kwargs,
     ):
         """
         Parameters
         ----------
-        model_dir : str | None
-            Local directory containing model files
-        model_version : str
-            Model version/directory name. Default: "rice_1B_stage2_8k_hf"
-        model_name_or_path : str | None
-            HuggingFace model name or path (takes precedence over model_dir)
+        model_name_or_path : str
+            HuggingFace model name or local path.
         device : str
             Device to use. Default: "cuda"
         pooling : str
-            Aggregation method: "last" or "mean". Default: "last"
-        use_flash_attention : bool
-            Whether to use flash_attention_2. Default: True
-        torch_dtype : torch.dtype | None
-            Data type for the model (e.g., torch.bfloat16). Default: None (auto)
+            Aggregation method: "last" or "mean". Default: "mean"
+        local_files_only : bool
+            Whether to force local model files for HF loading.
+        **kwargs
+            Model-specific options:
+            - use_flash_attention (default True)
+            - torch_dtype (default None)
         """
         _require_transformers()
         if pooling not in {"last", "mean"}:
             raise ValueError("pooling must be 'last' or 'mean'")
         self.pooling = pooling
         self.device = device
-        self.torch_dtype = torch_dtype
-
-        if model_name_or_path:
-            model_path = model_name_or_path
-            verify_local = False
-        elif model_dir:
-            model_path = os.path.join(model_dir, model_version)
-            verify_local = True
-        else:
-            raise ValueError("Provide model_name_or_path or model_dir + model_version.")
-
-        if verify_local and not os.path.exists(model_path):
-            raise ValueError(
-                "Model or tokenizer path does not exist. "
-                "If using a remote repo, pass model_name_or_path."
-            )
+        use_flash_attention = kwargs.get("use_flash_attention", None)
+        if use_flash_attention is None:
+            use_flash_attention = True
+        dtype = kwargs.get("dtype", torch.float16)
+        kwargs.pop("use_flash_attention", None)
+        kwargs.pop("dtype", None)
+        _raise_on_unused_kwargs(kwargs, "Rice8kEmbedder")
+        self.dtype = dtype
+        model_path = _resolve_model_path(model_name_or_path)
 
         # Load tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+        )
 
         # Prepare model loading arguments
         model_kwargs = {
@@ -416,8 +400,8 @@ class Rice8kEmbedder:
             "trust_remote_code": True,
         }
 
-        if torch_dtype is not None:
-            model_kwargs["torch_dtype"] = torch_dtype
+        if self.dtype is not None:
+            model_kwargs["dtype"] = self.dtype
 
         if use_flash_attention:
             try:
@@ -427,7 +411,11 @@ class Rice8kEmbedder:
                 pass
 
         # Load model
-        self.model = AutoModel.from_pretrained(model_path, **model_kwargs)
+        self.model = AutoModel.from_pretrained(
+            model_path,
+            local_files_only=local_files_only,
+            **model_kwargs,
+        )
         self.model = self.model.to(self.device)
         self.model.eval()
 
@@ -456,7 +444,8 @@ class Rice8kEmbedder:
 
         # Extract hidden states
         hidden_states = outputs.hidden_states  # Tuple of hidden states
-        last_hidden = torch.tensor(hidden_states[-1])  # Last layer
+        last_hidden = hidden_states[-1].clone()  # Last layer
+        # last_hidden = hidden_states[-1].clone()
         attention_mask = inputs["attention_mask"]
 
         if self.pooling == "last":
