@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +63,8 @@ class GWASQTLVariantExtractor:
         outdir: str = ".",
         save_file: bool = True,
         out_prefix: str = "gwas_qtl_sites",
+        log_level: int = logging.INFO,
+        log_file: str = "gwas_qtl_variant_extractor.log",
     ) -> None:
         self.gwas_path = Path(gwas_path)
         self.qtl_path = Path(qtl_path)
@@ -72,13 +75,36 @@ class GWASQTLVariantExtractor:
         self.outdir = Path(outdir)
         self.save_file = bool(save_file)
         self.out_prefix = out_prefix
+        self.log_file = log_file
 
         if self.type not in {"intersection", "union"}:
             raise ValueError("type must be one of: 'intersection', 'union'")
         if self.ext_length < 0:
             raise ValueError("ext_length must be >= 0")
 
+        self.outdir.mkdir(parents=True, exist_ok=True)
+        self.logger = logging.getLogger("GWASQTLVariantExtractor")
+        self.logger.setLevel(log_level)
+        self.logger.propagate = False
+        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        if not self.logger.handlers:
+            sh = logging.StreamHandler()
+            sh.setFormatter(fmt)
+            self.logger.addHandler(sh)
+            fh = logging.FileHandler(self.outdir / self.log_file)
+            fh.setFormatter(fmt)
+            self.logger.addHandler(fh)
+        self.logger.info("Initialized extractor")
+        self.logger.info(
+            "config: type=%s ext_length=%d save_file=%s out_prefix=%s",
+            self.type,
+            self.ext_length,
+            self.save_file,
+            self.out_prefix,
+        )
+
     def run(self) -> pd.DataFrame:
+        self.logger.info("Run started")
         gwas_df = self._read_gwas()
         qtl_df = self._read_qtl()
 
@@ -92,6 +118,7 @@ class GWASQTLVariantExtractor:
         )
 
         selected_sites = self._select_sites_from_vcf(gwas_df=gwas_df, qtl_tree=qtl_tree)
+        self.logger.info("Selected sites from VCF: n_sites=%d", len(selected_sites))
 
         if self.gene_interval_path is not None:
             gene_df = self._read_gene_intervals()
@@ -104,6 +131,7 @@ class GWASQTLVariantExtractor:
                 ext_length=self.ext_length,
             )
             result_df = self._filter_by_gene_intervals(selected_sites, gene_tree)
+            self.logger.info("Gene interval filtering applied: result_shape=%s", result_df.shape)
         else:
             result_df = pd.DataFrame(
                 [
@@ -117,11 +145,14 @@ class GWASQTLVariantExtractor:
                 ],
                 columns=["Chromosome", "Position", "Gene_id", "Gene_position"],
             )
+            self.logger.info("No gene interval filtering: result_shape=%s", result_df.shape)
 
         if self.save_file:
-            self.outdir.mkdir(parents=True, exist_ok=True)
             out_file = self.outdir / f"{self.out_prefix}_{self.type}.csv"
             result_df.to_csv(out_file, index=False)
+            self.logger.info("Saved output file: %s", out_file)
+
+        self.logger.info("Run finished")
 
         return result_df
 
@@ -132,6 +163,7 @@ class GWASQTLVariantExtractor:
         df = df[required].copy()
         df["Chromosome"] = df["Chromosome"].map(self.standard_chrom)
         df["Position"] = df["Position"].astype(int)
+        self.logger.info("Loaded GWAS: shape=%s unique_sites=%d", df.shape, df[["Chromosome", "Position"]].drop_duplicates().shape[0])
         return df
 
     def _read_qtl(self) -> pd.DataFrame:
@@ -142,6 +174,7 @@ class GWASQTLVariantExtractor:
         df["Chromosome"] = df["Chromosome"].map(self.standard_chrom)
         df["Start"] = df["Start"].astype(int)
         df["End"] = df["End"].astype(int)
+        self.logger.info("Loaded QTL: shape=%s", df.shape)
         return df
 
     def _read_gene_intervals(self) -> pd.DataFrame:
@@ -156,6 +189,7 @@ class GWASQTLVariantExtractor:
         df["Chromosome"] = df["Chromosome"].map(self.standard_chrom)
         df["Start"] = df["Start"].astype(int)
         df["End"] = df["End"].astype(int)
+        self.logger.info("Loaded gene intervals: shape=%s", df.shape)
         return df
 
     @staticmethod
@@ -185,6 +219,7 @@ class GWASQTLVariantExtractor:
             # intervaltree uses [begin, end), convert from 1-based inclusive to half-open
             tree.add(Interval(start, end + 1, IntervalRecord(start=start, end=end, record_id=record_id)))
 
+        self.logger.info("Built interval tree: n_chrom=%d n_intervals=%d", len(tree_dict), len(df))
         return tree_dict
 
     def _select_sites_from_vcf(
@@ -198,7 +233,9 @@ class GWASQTLVariantExtractor:
 
         selected: Set[Tuple[str, int]] = set()
 
+        total = 0
         for chrom, pos in self._iter_vcf_sites(self.vcf_path):
+            total += 1
             in_gwas = (chrom, pos) in gwas_sites
             in_qtl = bool(qtl_tree.get(chrom, IntervalTree()).overlap(pos, pos + 1))
 
@@ -208,6 +245,10 @@ class GWASQTLVariantExtractor:
             else:  # union
                 if in_gwas or in_qtl:
                     selected.add((chrom, pos))
+            if total % 200000 == 0:
+                self.logger.info("VCF scan progress: scanned=%d selected=%d", total, len(selected))
+
+        self.logger.info("VCF scan done: scanned=%d selected=%d", total, len(selected))
 
         return selected
 
@@ -231,7 +272,9 @@ class GWASQTLVariantExtractor:
                     }
                 )
 
-        return pd.DataFrame(rows, columns=["Chromosome", "Position", "Gene_id", "Gene_position"])
+        out = pd.DataFrame(rows, columns=["Chromosome", "Position", "Gene_id", "Gene_position"])
+        self.logger.info("Built filtered dataframe: shape=%s", out.shape)
+        return out
 
     @staticmethod
     def _iter_vcf_sites(vcf_path: Path) -> Iterable[Tuple[str, int]]:
@@ -293,6 +336,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--outdir", default=".", help="Output directory when save_file is enabled")
     parser.add_argument("--out_prefix", default="gwas_qtl_sites", help="Output file prefix")
+    parser.add_argument("--log_file", default="gwas_qtl_variant_extractor.log", help="Log filename under outdir")
+    parser.add_argument("--log_level", default="INFO", help="Log level: DEBUG/INFO/WARNING/ERROR")
     parser.add_argument(
         "--save_file",
         action="store_true",
@@ -322,6 +367,8 @@ def main() -> None:
         outdir=args.outdir,
         save_file=args.save_file,
         out_prefix=args.out_prefix,
+        log_file=args.log_file,
+        log_level=getattr(logging, str(args.log_level).upper(), logging.INFO),
     )
     out = extractor.run()
     print(out.head())
