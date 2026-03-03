@@ -137,6 +137,7 @@ class VariantFeatureBuilder:
         random_seed: int = 42,
         flank_k: int = 20,
         pca_var_threshold: float = 0.95,
+        use_pca: bool = True,
         save_file: bool = True,
         file_format: str = "csv",
         log_level: int = logging.INFO,
@@ -169,6 +170,8 @@ class VariantFeatureBuilder:
             Upstream/downstream context length for site context sequence.
         pca_var_threshold : float
             Cumulative explained variance threshold for PCA component selection.
+        use_pca : bool
+            Whether to apply PCA to embedding matrices.
         save_file : bool
             Whether to persist generated dataframes.
         file_format : str
@@ -190,6 +193,7 @@ class VariantFeatureBuilder:
         self.random_seed = int(random_seed)
         self.flank_k = int(flank_k)
         self.pca_var_threshold = float(pca_var_threshold)
+        self.use_pca = bool(use_pca)
         self.save_file = bool(save_file)
         self.file_format = file_format.lower().strip()
         if self.file_format not in {"csv", "parquet"}:
@@ -236,6 +240,7 @@ class VariantFeatureBuilder:
             self.save_file,
             self.file_format,
         )
+        self.logger.info("use_pca=%s", self.use_pca)
 
     # --------------------------
     # Main pipeline
@@ -253,7 +258,9 @@ class VariantFeatureBuilder:
         self._load_vcf_genotypes()
 
         ds012 = self.build_genotype_012_matrix()
-        gene_seq_df, gene_pc_df = self.build_gene_sequence_pca_dataset()
+        gene_seq_df, gene_emb_df, gene_pca_df, gene_ext_seq_df, gene_ext_emb_df, gene_ext_pca_df = (
+            self.build_gene_sequence_pca_dataset()
+        )
         concat_embed_df = self.build_concat_altseq_embedding_dataset()
         extseq_raw_df, extseq_pc_df = self.build_extseq_embedding_pca_dataset()
         distance_gt_df = self.build_distance_times_genotype_dataset()
@@ -263,7 +270,11 @@ class VariantFeatureBuilder:
         outputs: Dict[str, pd.DataFrame] = {
             "genotype_012": ds012,
             "gene_sequence": gene_seq_df,
-            "gene_pca": gene_pc_df,
+            "gene_embedding": gene_emb_df,
+            "gene_pca": gene_pca_df,
+            "gene_ext_sequence": gene_ext_seq_df,
+            "gene_ext_embedding": gene_ext_emb_df,
+            "gene_ext_pca": gene_ext_pca_df,
             "concat_embedding": concat_embed_df,
             "extseq_raw": extseq_raw_df,
             "extseq_pca": extseq_pc_df,
@@ -394,13 +405,15 @@ class VariantFeatureBuilder:
     # --------------------------
     # Step 2: gene sequence + embedding PCA
     # --------------------------
-    def build_gene_sequence_pca_dataset(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Build gene sequence table and per-gene PCA embedding feature table.
+    def build_gene_sequence_pca_dataset(
+        self,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Build gene sequence matrices, embeddings, and optional PCA features.
 
         Returns
         -------
-        Tuple[pd.DataFrame, pd.DataFrame]
-            ``(gene_sequence_df, gene_pca_df)``.
+        Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
+            ``(gene_seq_df, gene_emb_df, gene_pca_df, gene_ext_seq_df, gene_ext_emb_df, gene_ext_pca_df)``.
         """
         self._check_embedder()
         gene_map = self._build_gene_site_map()
@@ -417,10 +430,17 @@ class VariantFeatureBuilder:
 
         # sample x gene sequence table
         gene_seq_data: Dict[str, List[str]] = {}
+        gene_ext_seq_data: Dict[str, List[str]] = {}
         for gi, (gene_id, ginfo) in enumerate(gene_map.items(), start=1):
             ref_seq = ref_gene_seq[gene_id]
             ref_arr = np.frombuffer(ref_seq.encode("ascii"), dtype=np.uint8)
             seq_mat = np.tile(ref_arr, (n_samples, 1))
+
+            ext_start = max(1, int(ginfo["gene_start"]) - self.flank_k)
+            ext_end = int(ginfo["gene_end"]) + self.flank_k
+            ext_ref_seq = self._fetch_sequence(str(ginfo["chrom"]), ext_start, ext_end)
+            ext_ref_arr = np.frombuffer(ext_ref_seq.encode("ascii"), dtype=np.uint8)
+            ext_mat = np.tile(ext_ref_arr, (n_samples, 1))
 
             sites = ginfo["sites"]
             site_pos = np.array([int(ginfo["site_to_gene_pos"][s]) - 1 for s in sites], dtype=np.int64)
@@ -434,30 +454,79 @@ class VariantFeatureBuilder:
                 alt_char = str(self.site_meta[site]["Alt"])[0]
                 seq_mat[mask, idx] = ord(alt_char)
 
+                ext_idx = idx + self.flank_k
+                if 0 <= ext_idx < ext_mat.shape[1]:
+                    ext_mat[mask, ext_idx] = ord(alt_char)
+
             gene_seq_data[gene_id] = [row.tobytes().decode("ascii") for row in seq_mat]
+            gene_ext_seq_data[gene_id] = [row.tobytes().decode("ascii") for row in ext_mat]
             if gi % 10 == 0 or gi == len(gene_map):
                 self.logger.info("Gene mutation sequence progress: %d/%d", gi, len(gene_map))
 
         gene_seq_df = pd.DataFrame({"sample": self.samples, **gene_seq_data})
+        gene_ext_seq_df = pd.DataFrame({"sample": self.samples, **gene_ext_seq_data})
         self._log_df_info("gene_sequence", gene_seq_df)
+        self._log_df_info("gene_ext_sequence", gene_ext_seq_df)
 
-        # Embed per gene and PCA per gene
-        blocks = []
-        columns = ["sample"]
+        # Embed per gene, then optional PCA per gene.
+        gene_emb_blocks = []
+        gene_emb_cols = ["sample"]
+        gene_pca_blocks = []
+        gene_pca_cols = ["sample"]
+
+        gene_ext_emb_blocks = []
+        gene_ext_emb_cols = ["sample"]
+        gene_ext_pca_blocks = []
+        gene_ext_pca_cols = ["sample"]
+
         for gi, gene_id in enumerate(gene_map.keys(), start=1):
             seqs = gene_seq_df[gene_id].astype(str).tolist()
             emb = self._embed_sequences(seqs)  # n x d
-            comp = self._pca_reduce(emb, self.pca_var_threshold)
-            blocks.append(comp)
-            for k in range(comp.shape[1]):
-                columns.append(f"{gene_id}_PC{k+1}")
-            if gi % 10 == 0 or gi == len(gene_map):
-                self.logger.info("Gene embedding/PCA progress: %d/%d", gi, len(gene_map))
+            gene_emb_blocks.append(emb)
+            gene_emb_cols.extend([f"{gene_id}_embed_{i}" for i in range(emb.shape[1])])
 
-        out = pd.DataFrame(np.concatenate(blocks, axis=1), columns=columns[1:])
-        out.insert(0, "sample", self.samples)
-        self._log_df_info("gene_pca", out)
-        return gene_seq_df, out
+            if self.use_pca:
+                comp = self._pca_reduce(emb, self.pca_var_threshold)
+                gene_pca_blocks.append(comp)
+                gene_pca_cols.extend([f"{gene_id}_PC{k+1}" for k in range(comp.shape[1])])
+
+            ext_seqs = gene_ext_seq_df[gene_id].astype(str).tolist()
+            ext_emb = self._embed_sequences(ext_seqs)
+            gene_ext_emb_blocks.append(ext_emb)
+            gene_ext_emb_cols.extend([f"{gene_id}_ext_embed_{i}" for i in range(ext_emb.shape[1])])
+
+            if self.use_pca:
+                ext_comp = self._pca_reduce(ext_emb, self.pca_var_threshold)
+                gene_ext_pca_blocks.append(ext_comp)
+                gene_ext_pca_cols.extend([f"{gene_id}_ext_PC{k+1}" for k in range(ext_comp.shape[1])])
+
+            if gi % 10 == 0 or gi == len(gene_map):
+                self.logger.info("Gene embedding progress: %d/%d", gi, len(gene_map))
+
+        gene_emb_df = pd.DataFrame(np.concatenate(gene_emb_blocks, axis=1), columns=gene_emb_cols[1:])
+        gene_emb_df.insert(0, "sample", self.samples)
+
+        if self.use_pca:
+            gene_pca_df = pd.DataFrame(np.concatenate(gene_pca_blocks, axis=1), columns=gene_pca_cols[1:])
+            gene_pca_df.insert(0, "sample", self.samples)
+        else:
+            gene_pca_df = pd.DataFrame({"sample": self.samples})
+
+        gene_ext_emb_df = pd.DataFrame(np.concatenate(gene_ext_emb_blocks, axis=1), columns=gene_ext_emb_cols[1:])
+        gene_ext_emb_df.insert(0, "sample", self.samples)
+
+        if self.use_pca:
+            gene_ext_pca_df = pd.DataFrame(np.concatenate(gene_ext_pca_blocks, axis=1), columns=gene_ext_pca_cols[1:])
+            gene_ext_pca_df.insert(0, "sample", self.samples)
+        else:
+            gene_ext_pca_df = pd.DataFrame({"sample": self.samples})
+
+        self._log_df_info("gene_embedding", gene_emb_df)
+        self._log_df_info("gene_pca", gene_pca_df)
+        self._log_df_info("gene_ext_embedding", gene_ext_emb_df)
+        self._log_df_info("gene_ext_pca", gene_ext_pca_df)
+
+        return gene_seq_df, gene_emb_df, gene_pca_df, gene_ext_seq_df, gene_ext_emb_df, gene_ext_pca_df
 
     # --------------------------
     # Step 3: concat seq embedding
@@ -526,11 +595,18 @@ class VariantFeatureBuilder:
                 emb = self._embed_sequences(seqs)
                 dosage = self.site_meta[site]["dosage"].reshape(-1, 1)
                 weighted = emb * dosage
-                site_comp_cache[site] = self._pca_reduce(weighted, self.pca_var_threshold)
+                if self.use_pca:
+                    site_comp_cache[site] = self._pca_reduce(weighted, self.pca_var_threshold)
+                else:
+                    site_comp_cache[site] = weighted
             comp = site_comp_cache[site]
             blocks.append(comp)
-            for k in range(comp.shape[1]):
-                out_cols.append(f"{base_name}_PC{k+1}")
+            if self.use_pca:
+                for k in range(comp.shape[1]):
+                    out_cols.append(f"{base_name}_PC{k+1}")
+            else:
+                for k in range(comp.shape[1]):
+                    out_cols.append(f"{base_name}_embed_{k}")
             if si % 500 == 0 or si == len(self.record_order):
                 self.logger.info("Extended-sequence PCA progress: %d/%d", si, len(self.record_order))
 
@@ -715,6 +791,16 @@ class VariantFeatureBuilder:
             out[gene_id] = seq
         self.logger.info("Fetched reference gene sequences: genes=%d", len(out))
         return out
+
+    def _fetch_sequence(self, chrom: str, start: int, end: int) -> str:
+        """Fetch a reference sequence from FASTA for a given 1-based interval."""
+        try:
+            import pysam  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise ImportError("pysam is required. Please install pysam.") from exc
+
+        fa = pysam.FastaFile(str(self.fasta_path))
+        return fa.fetch(chrom, start - 1, end)
 
     def _build_site_context_sequences(self, k: int) -> Dict[Tuple[str, int], Dict[str, str]]:
         """Build site-centered reference/alternate context sequences.
@@ -922,6 +1008,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--random_seed", type=int, default=42)
     p.add_argument("--flank_k", type=int, default=20)
     p.add_argument("--pca_var_threshold", type=float, default=0.95)
+    p.add_argument("--use_pca", action="store_true", default=True)
+    p.add_argument("--no-use_pca", dest="use_pca", action="store_false")
     p.add_argument("--file_format", choices=["csv", "parquet"], default="csv")
 
     p.add_argument("--save_file", action="store_true", default=True)
@@ -1009,6 +1097,7 @@ def main() -> None:
         random_seed=args.random_seed,
         flank_k=args.flank_k,
         pca_var_threshold=args.pca_var_threshold,
+        use_pca=args.use_pca,
         save_file=args.save_file,
         file_format=args.file_format,
     )
