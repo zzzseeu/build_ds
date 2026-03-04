@@ -223,3 +223,7 @@ test_inputs/
 *.csv
 
 *.ipynb
+*.npy
+*.e
+*.o
+*.sh
