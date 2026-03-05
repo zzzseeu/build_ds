@@ -271,6 +271,8 @@ class VariantFeatureBuilder:
 
         for gi, (gene, g) in enumerate(groups, start=1):
             chrom = str(g["Chromosome"].iloc[0])
+            rep = g.iloc[0]
+            gene_feat = self._site_feature_name(rep, include_gene=True)
 
             gpos = self.variant_df[self.variant_df["Gene_id"] == gene][["Position", "Gene_position"]].drop_duplicates()
             starts = (gpos["Position"].astype(int) - gpos["Gene_position"].astype(int) + 1).values
@@ -296,12 +298,12 @@ class VariantFeatureBuilder:
                         if 0 <= idx < len(seq):
                             seq[idx] = str(r["Alt"])
                 row[s] = "".join(seq)
-            gene_rows[gene] = row
+            gene_rows[gene_feat] = row
             if gi % 20 == 0 or gi == len(groups):
                 self.logger.info("Gene sequence progress: %d/%d", gi, len(groups))
 
         gene_seq_by_gene = pd.DataFrame.from_dict(gene_rows, orient="index")
-        gene_seq_by_gene.index.name = "gene_name"
+        gene_seq_by_gene.index.name = "feature"
         gene_seq_df = gene_seq_by_gene.T
         gene_seq_df.index.name = "sample"
         gene_seq_df = gene_seq_df.reset_index()
@@ -316,7 +318,7 @@ class VariantFeatureBuilder:
         row_data: Dict[str, Dict[str, str]] = {}
 
         for _, r in genotype_df.iterrows():
-            feat = self._site_feature_name(r)
+            feat = self._site_feature_name(r, include_gene=False)
             ref_seq, alt_seq = contexts[(str(r["Chromosome"]), int(r["Position"]), str(r["Ref"]), str(r["Alt"]))]
             row = {}
             for s in self.samples:
@@ -336,7 +338,7 @@ class VariantFeatureBuilder:
         dist_map: Dict[str, float] = {}
 
         for _, r in genotype_df.iterrows():
-            feat = self._site_feature_name(r)
+            feat = self._site_feature_name(r, include_gene=False)
             key = (str(r["Chromosome"]), int(r["Position"]), str(r["Ref"]), str(r["Alt"]))
             ref_seq, alt_seq = contexts[key]
             ref_emb = self._embed_sequences([ref_seq])[0]
@@ -347,7 +349,7 @@ class VariantFeatureBuilder:
         for s in self.samples:
             row = {"sample": s}
             for _, r in genotype_df.iterrows():
-                feat = self._site_feature_name(r)
+                feat = self._site_feature_name(r, include_gene=False)
                 row[feat] = dist_map[feat] * float(r[s])
             rows.append(row)
 
@@ -398,7 +400,7 @@ class VariantFeatureBuilder:
     def _sample_site_genotype_matrix(self, genotype_df: pd.DataFrame) -> pd.DataFrame:
         feat_rows = {}
         for _, r in genotype_df.iterrows():
-            feat = self._site_feature_name(r)
+            feat = self._site_feature_name(r, include_gene=False)
             feat_rows[feat] = {s: float(r[s]) for s in self.samples}
         mat = pd.DataFrame.from_dict(feat_rows, orient="index").T
         mat.index.name = "sample"
@@ -426,8 +428,11 @@ class VariantFeatureBuilder:
         self.logger.info("Built site contexts: n=%d", len(out))
         return out
 
-    def _site_feature_name(self, row: pd.Series) -> str:
-        return f"{row['Chromosome']}:{int(row['Position'])}:{row['Ref']}>{row['Alt']}-{row['gene_name']}"
+    def _site_feature_name(self, row: pd.Series, include_gene: bool = False) -> str:
+        base = f"{row['Chromosome']}:{int(row['Position'])}:{row['Ref']}>{row['Alt']}"
+        if include_gene:
+            return f"{base}-{row['gene_name']}"
+        return base
 
     def _embed_sequences(self, seqs: List[str]) -> np.ndarray:
         pending: List[str] = []
