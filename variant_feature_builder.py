@@ -305,8 +305,7 @@ class VariantFeatureBuilder:
         gene_seq_by_gene = pd.DataFrame.from_dict(gene_rows, orient="index")
         gene_seq_by_gene.index.name = "feature"
         gene_seq_df = gene_seq_by_gene.T
-        gene_seq_df.index.name = "sample"
-        gene_seq_df = gene_seq_df.reset_index()
+        gene_seq_df = gene_seq_df.reset_index(names="sample")
         self.logger.info("Built gene_seq_df: shape=%s", gene_seq_df.shape)
         return gene_seq_df
 
@@ -328,8 +327,7 @@ class VariantFeatureBuilder:
         snp_by_site = pd.DataFrame.from_dict(row_data, orient="index")
         snp_by_site.index.name = "site"
         snp_extseq_df = snp_by_site.T
-        snp_extseq_df.index.name = "sample"
-        snp_extseq_df = snp_extseq_df.reset_index()
+        snp_extseq_df = snp_extseq_df.reset_index(names="sample")
         self.logger.info("Built snp_extseq_df: shape=%s", snp_extseq_df.shape)
         return snp_extseq_df
 
@@ -435,32 +433,22 @@ class VariantFeatureBuilder:
         return base
 
     def _embed_sequences(self, seqs: List[str]) -> np.ndarray:
-        pending: List[str] = []
         vectors: Dict[str, np.ndarray] = {}
+        unique_seqs = list(dict.fromkeys(seqs))
 
-        for s in seqs:
+        for i, s in enumerate(unique_seqs, start=1):
             key = self._seq_hash(s)
             p = self.cache_dir / f"{key}.npy"
             if p.exists():
-                vectors[s] = np.load(p)
+                v = np.load(p)
             else:
-                pending.append(s)
+                # Embed one sequence each call to avoid batch embedding.
+                v = self._to_1d_numpy(self.embedder(s))
+                np.save(p, v)
+            vectors[s] = v
 
-        if pending:
-            try:
-                arr = self._to_2d_numpy(self.embedder(pending))
-                if arr.shape[0] != len(pending):
-                    raise ValueError("Batch size mismatch")
-                for s, v in zip(pending, arr):
-                    p = self.cache_dir / f"{self._seq_hash(s)}.npy"
-                    np.save(p, v)
-                    vectors[s] = v
-            except Exception:
-                for s in pending:
-                    v = self._to_1d_numpy(self.embedder(s))
-                    p = self.cache_dir / f"{self._seq_hash(s)}.npy"
-                    np.save(p, v)
-                    vectors[s] = v
+            if i % 500 == 0 or i == len(unique_seqs):
+                self.logger.info("Sequence embedding progress: %d/%d", i, len(unique_seqs))
 
         return np.vstack([vectors[s] for s in seqs]).astype(np.float32)
 
