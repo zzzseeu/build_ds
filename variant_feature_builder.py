@@ -127,6 +127,13 @@ class VariantFeatureBuilder:
 
         for name, df in outputs.items():
             self._save_both(df, name)
+            if "sample" not in df.columns:
+                self.logger.info(
+                    "Skip split for %s: no 'sample' column (shape=%s)",
+                    name,
+                    df.shape,
+                )
+                continue
             split = self._split_df(df)
             self._save_both(split["train"], f"{name}_train")
             self._save_both(split["val"], f"{name}_val")
