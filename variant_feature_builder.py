@@ -125,7 +125,13 @@ class VariantFeatureBuilder:
             "snp_extseq_distance_df": snp_extseq_distance_df,
         }
 
-        for name, df in outputs.items():
+        # Only save embedding-feature matrices (sample x feature). Sequence matrices are not persisted.
+        save_outputs = {
+            "gene_seq_embedding_df": gene_seq_embedding_df,
+            "snp_extseq_embedding_df": snp_extseq_embedding_df,
+            "snp_extseq_distance_df": snp_extseq_distance_df,
+        }
+        for name, df in save_outputs.items():
             self._save_both(df, name)
             if "sample" not in df.columns:
                 self.logger.info(
@@ -153,7 +159,7 @@ class VariantFeatureBuilder:
             raise ValueError(f"variant_df missing columns: {miss}")
 
         df = df.copy()
-        df["Chromosome"] = df["Chromosome"].astype(str)
+        df["Chromosome"] = df["Chromosome"].astype(str).map(self._standard_chrom_name)
         df["Position"] = df["Position"].astype(int)
         df["Gene_id"] = df["Gene_id"].astype(str)
         df["Gene_position"] = df["Gene_position"].astype(int)
@@ -197,7 +203,7 @@ class VariantFeatureBuilder:
 
         site_rows: Dict[Tuple[str, int], Dict] = {}
         for rec in vcf:
-            key = (str(rec.chrom), int(rec.pos))
+            key = (self._standard_chrom_name(str(rec.chrom)), int(rec.pos))
             if key not in target_sites:
                 continue
             ref = str(rec.ref)
@@ -271,6 +277,7 @@ class VariantFeatureBuilder:
 
         assert self.variant_df is not None
         fa = pysam.FastaFile(str(self.fasta_path))
+        fa_chrom_map = self._build_standard_chrom_map(list(fa.references))
 
         gene_rows: Dict[str, Dict[str, str]] = {}
         groups = genotype_df.groupby("gene_name", sort=True)
@@ -278,6 +285,7 @@ class VariantFeatureBuilder:
 
         for gi, (gene, g) in enumerate(groups, start=1):
             chrom = str(g["Chromosome"].iloc[0])
+            fa_chrom = self._resolve_chrom_for_fasta(chrom, fa_chrom_map)
             rep = g.iloc[0]
             gene_feat = self._site_feature_name(rep, include_gene=True)
 
@@ -287,7 +295,7 @@ class VariantFeatureBuilder:
             max_gene_pos = int(gpos["Gene_position"].max())
             gene_end = gene_start + max_gene_pos - 1
 
-            ref_seq = fa.fetch(chrom, gene_start - 1, gene_end)
+            ref_seq = fa.fetch(fa_chrom, gene_start - 1, gene_end)
             row = {}
             for s in self.samples:
                 seq = list(ref_seq)
@@ -419,16 +427,18 @@ class VariantFeatureBuilder:
             raise ImportError("pysam is required") from exc
 
         fa = pysam.FastaFile(str(self.fasta_path))
+        fa_chrom_map = self._build_standard_chrom_map(list(fa.references))
         out: Dict[Tuple[str, int, str, str], Tuple[str, str]] = {}
         uniq = genotype_df[["Chromosome", "Position", "Ref", "Alt"]].drop_duplicates()
 
         for _, r in uniq.iterrows():
             chrom = str(r["Chromosome"])
+            fa_chrom = self._resolve_chrom_for_fasta(chrom, fa_chrom_map)
             pos = int(r["Position"])
             ref = str(r["Ref"])
             alt = str(r["Alt"])
-            left = fa.fetch(chrom, max(1, pos - self.flank_k) - 1, pos - 1)
-            right = fa.fetch(chrom, pos, pos + self.flank_k)
+            left = fa.fetch(fa_chrom, max(1, pos - self.flank_k) - 1, pos - 1)
+            right = fa.fetch(fa_chrom, pos, pos + self.flank_k)
             out[(chrom, pos, ref, alt)] = (f"{left}{ref}{right}", f"{left}{alt}{right}")
         self.logger.info("Built site contexts: n=%d", len(out))
         return out
@@ -523,6 +533,38 @@ class VariantFeatureBuilder:
     @staticmethod
     def _seq_hash(seq: str) -> str:
         return hashlib.sha1(seq.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _standard_chrom_name(chrom: str) -> str:
+        c = str(chrom).strip()
+        if not c:
+            return c
+        low = c.lower()
+        if low.startswith("chr"):
+            core = c[3:]
+        else:
+            core = c
+        core = core.strip()
+        up = core.upper()
+        if up == "MT":
+            core = "M"
+        return f"Chr{core}"
+
+    def _build_standard_chrom_map(self, chroms: List[str]) -> Dict[str, str]:
+        cmap: Dict[str, str] = {}
+        for c in chroms:
+            raw = str(c)
+            std = self._standard_chrom_name(raw)
+            if std not in cmap:
+                cmap[std] = raw
+        return cmap
+
+    def _resolve_chrom_for_fasta(self, std_chrom: str, cmap: Dict[str, str]) -> str:
+        if std_chrom in cmap:
+            return cmap[std_chrom]
+        if std_chrom.startswith("Chr") and std_chrom[3:] in cmap:
+            return cmap[std_chrom[3:]]
+        raise KeyError(f"Chromosome {std_chrom} not found in FASTA references")
 
     @staticmethod
     def _to_1d_numpy(x) -> np.ndarray:
