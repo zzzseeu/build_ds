@@ -32,7 +32,6 @@ class VariantFeatureBuilder:
         embedder_kwargs: Dict,
         sample_list_path: str | None,
         test_ratio: float,
-        val_ratio: float,
         random_seed: int,
         flank_k: int,
         pca_var_threshold: float,
@@ -51,7 +50,6 @@ class VariantFeatureBuilder:
         self.sample_list_path = Path(sample_list_path) if sample_list_path else None
 
         self.test_ratio = float(test_ratio)
-        self.val_ratio = float(val_ratio)
         self.random_seed = int(random_seed)
         self.flank_k = int(flank_k)
         self.pca_var_threshold = float(pca_var_threshold)
@@ -141,8 +139,7 @@ class VariantFeatureBuilder:
                 )
                 continue
             split = self._split_df(df)
-            self._save_both(split["train"], f"{name}_train")
-            self._save_both(split["val"], f"{name}_val")
+            self._save_both(split["trainval"], f"{name}_trainval")
             self._save_both(split["test"], f"{name}_test")
 
         self.logger.info("Pipeline finished")
@@ -506,21 +503,16 @@ class VariantFeatureBuilder:
         extra_test_idx = remaining_idx[:extra_n]
         test_idx = np.concatenate([isolated_idx, extra_test_idx]) if len(isolated_idx) > 0 else extra_test_idx
 
-        rem_idx = np.array([i for i in all_idx if i not in set(test_idx)], dtype=int)
-        rng.shuffle(rem_idx)
-        val_n = int(round(len(rem_idx) * self.val_ratio))
-        val_idx = rem_idx[:val_n]
-        train_idx = rem_idx[val_n:]
+        trainval_idx = np.array([i for i in all_idx if i not in set(test_idx)], dtype=int)
+        rng.shuffle(trainval_idx)
 
         split = {
-            "train": df.iloc[train_idx].reset_index(drop=True),
-            "val": df.iloc[val_idx].reset_index(drop=True),
+            "trainval": df.iloc[trainval_idx].reset_index(drop=True),
             "test": df.iloc[test_idx].reset_index(drop=True),
         }
         self.logger.info(
-            "Split result: train=%d val=%d test=%d isolated_in_test=%d",
-            len(split["train"]),
-            len(split["val"]),
+            "Split result: trainval=%d test=%d isolated_in_test=%d",
+            len(split["trainval"]),
             len(split["test"]),
             split["test"]["sample"].astype(str).isin(isolated_set).sum(),
         )
@@ -615,7 +607,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample_list_path", default=None)
 
     p.add_argument("--test_ratio", type=float, default=0.2)
-    p.add_argument("--val_ratio", type=float, default=0.1)
     p.add_argument("--random_seed", type=int, default=42)
     p.add_argument("--flank_k", type=int, default=20)
     p.add_argument("--pca_var_threshold", type=float, default=0.95)
@@ -642,7 +633,6 @@ def main() -> None:
         embedder_kwargs=ekw,
         sample_list_path=args.sample_list_path,
         test_ratio=args.test_ratio,
-        val_ratio=args.val_ratio,
         random_seed=args.random_seed,
         flank_k=args.flank_k,
         pca_var_threshold=args.pca_var_threshold,
