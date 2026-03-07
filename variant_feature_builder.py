@@ -29,13 +29,13 @@ class VariantFeatureBuilder:
         model_name_or_path: str,
         pooling: str,
         local_files_only: bool,
-        embedder_kwargs: Dict,
-        sample_list_path: str | None,
-        test_ratio: float,
-        random_seed: int,
-        flank_k: int,
-        pca_var_threshold: float,
-        use_pca: bool,
+        embedder_kwargs: Dict = {},
+        sample_list_path: str = "",
+        test_ratio: float = 0.2,
+        random_seed: int = 42,
+        flank_k: int = 50,
+        use_pca: bool = True,
+        pca_var_threshold: float = 0.95,
     ) -> None:
         self.variant_df_path = Path(variant_df_path)
         self.vcf_path = Path(vcf_path)
@@ -46,14 +46,14 @@ class VariantFeatureBuilder:
         self.model_name_or_path = model_name_or_path
         self.pooling = pooling
         self.local_files_only = bool(local_files_only)
-        self.embedder_kwargs = dict(embedder_kwargs or {})
+        self.embedder_kwargs = dict(embedder_kwargs) if embedder_kwargs else {}
         self.sample_list_path = Path(sample_list_path) if sample_list_path else None
 
-        self.test_ratio = float(test_ratio)
-        self.random_seed = int(random_seed)
-        self.flank_k = int(flank_k)
-        self.pca_var_threshold = float(pca_var_threshold)
-        self.use_pca = bool(use_pca)
+        self.test_ratio = float(test_ratio) if test_ratio else None
+        self.random_seed = int(random_seed) if random_seed else None
+        self.flank_k = int(flank_k) if flank_k else None
+        self.pca_var_threshold = float(pca_var_threshold) if pca_var_threshold else None
+        self.use_pca = bool(use_pca) if use_pca else None
 
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.cache_dir = self.outdir / "embedding_cache"
@@ -213,11 +213,13 @@ class VariantFeatureBuilder:
             raise ImportError("pysam is required") from exc
 
         assert self.variant_df is not None
-        target_sites = set(zip(self.variant_df["Chromosome"], self.variant_df["Position"]))
+        target_sites = set(
+            zip(self.variant_df["Chromosome"], self.variant_df["Position"])
+        )
 
         vcf = pysam.VariantFile(str(self.vcf_path))
         vcf_samples = list(vcf.header.samples)
-        self.sample_name_map = {s: f"sample_{i+1}" for i, s in enumerate(vcf_samples)}
+        self.sample_name_map = {s: f"sample_{i + 1}" for i, s in enumerate(vcf_samples)}
         self.samples = [self.sample_name_map[s] for s in vcf_samples]
         self.logger.info("VCF samples=%d standardized to sample_N", len(self.samples))
 
@@ -279,7 +281,9 @@ class VariantFeatureBuilder:
                     "Alt": site_rows[(c, p)]["Alt"],
                     **{s: site_rows[(c, p)][s] for s in self.samples},
                 }
-                for c, p in merged[["Chromosome", "Position"]].itertuples(index=False, name=None)
+                for c, p in merged[["Chromosome", "Position"]].itertuples(
+                    index=False, name=None
+                )
                 if (c, p) in site_rows
             ]
         )
@@ -297,12 +301,14 @@ class VariantFeatureBuilder:
 
     def _build_geno012_df(self, genotype_df: pd.DataFrame) -> pd.DataFrame:
         """Build sample x SNP matrix encoded in 0/1/2 from filtered genotype_df."""
-        snp_df = genotype_df[["Chromosome", "Position", "Ref", "Alt"] + self.samples].drop_duplicates(
-            subset=["Chromosome", "Position", "Ref", "Alt"]
-        )
+        snp_df = genotype_df[
+            ["Chromosome", "Position", "Ref", "Alt"] + self.samples
+        ].drop_duplicates(subset=["Chromosome", "Position", "Ref", "Alt"])
         snp_names = [
             f"{c}:{int(p)}:{r}>{a}"
-            for c, p, r, a in snp_df[["Chromosome", "Position", "Ref", "Alt"]].itertuples(index=False, name=None)
+            for c, p, r, a in snp_df[
+                ["Chromosome", "Position", "Ref", "Alt"]
+            ].itertuples(index=False, name=None)
         ]
         mat = snp_df[self.samples].to_numpy(dtype=np.float32).T
         geno012_df = pd.DataFrame(mat, columns=snp_names)
@@ -333,8 +339,12 @@ class VariantFeatureBuilder:
             rep = g.iloc[0]
             gene_feat = self._site_feature_name(rep, include_gene=True)
 
-            gpos = self.variant_df[self.variant_df["Gene_id"] == gene][["Position", "Gene_position"]].drop_duplicates()
-            starts = (gpos["Position"].astype(int) - gpos["Gene_position"].astype(int) + 1).values
+            gpos = self.variant_df[self.variant_df["Gene_id"] == gene][
+                ["Position", "Gene_position"]
+            ].drop_duplicates()
+            starts = (
+                gpos["Position"].astype(int) - gpos["Gene_position"].astype(int) + 1
+            ).values
             gene_start = int(np.median(starts))
             max_gene_pos = int(gpos["Gene_position"].max())
             gene_end = gene_start + max_gene_pos - 1
@@ -377,7 +387,9 @@ class VariantFeatureBuilder:
 
         for _, r in genotype_df.iterrows():
             feat = self._site_feature_name(r, include_gene=False)
-            ref_seq, alt_seq = contexts[(str(r["Chromosome"]), int(r["Position"]), str(r["Ref"]), str(r["Alt"]))]
+            ref_seq, alt_seq = contexts[
+                (str(r["Chromosome"]), int(r["Position"]), str(r["Ref"]), str(r["Alt"]))
+            ]
             row = {}
             for s in self.samples:
                 row[s] = alt_seq if int(r[s]) > 0 else ref_seq
@@ -396,7 +408,12 @@ class VariantFeatureBuilder:
 
         for _, r in genotype_df.iterrows():
             feat = self._site_feature_name(r, include_gene=False)
-            key = (str(r["Chromosome"]), int(r["Position"]), str(r["Ref"]), str(r["Alt"]))
+            key = (
+                str(r["Chromosome"]),
+                int(r["Position"]),
+                str(r["Ref"]),
+                str(r["Alt"]),
+            )
             ref_seq, alt_seq = contexts[key]
             ref_emb = self._embed_sequences([ref_seq])[0]
             alt_emb = self._embed_sequences([alt_seq])[0]
@@ -423,7 +440,12 @@ class VariantFeatureBuilder:
         name_prefix: str,
         weight_df: pd.DataFrame | None,
     ) -> pd.DataFrame:
-        self.logger.info("Embedding matrix: %s shape=%s use_pca=%s", name_prefix, seq_df.shape, self.use_pca)
+        self.logger.info(
+            "Embedding matrix: %s shape=%s use_pca=%s",
+            name_prefix,
+            seq_df.shape,
+            self.use_pca,
+        )
         features = [c for c in seq_df.columns if c != "sample"]
         blocks = []
         out_cols = ["sample"]
@@ -438,13 +460,15 @@ class VariantFeatureBuilder:
             if self.use_pca:
                 comp = self._pca_reduce(emb, self.pca_var_threshold)
                 blocks.append(comp)
-                out_cols.extend([f"{feat}_PC{k+1}" for k in range(comp.shape[1])])
+                out_cols.extend([f"{feat}_PC{k + 1}" for k in range(comp.shape[1])])
             else:
                 blocks.append(emb)
                 out_cols.extend([f"{feat}_embed_{k}" for k in range(emb.shape[1])])
 
             if i % self.log_every_feature == 0 or i == len(features):
-                self.logger.info("Embedding progress(%s): %d/%d", name_prefix, i, len(features))
+                self.logger.info(
+                    "Embedding progress(%s): %d/%d", name_prefix, i, len(features)
+                )
 
         out = pd.DataFrame(np.concatenate(blocks, axis=1), columns=out_cols[1:])
         out.insert(0, "sample", seq_df["sample"].tolist())
@@ -464,7 +488,9 @@ class VariantFeatureBuilder:
         mat = mat.reset_index()
         return mat
 
-    def _build_site_contexts(self, genotype_df: pd.DataFrame) -> Dict[Tuple[str, int, str, str], Tuple[str, str]]:
+    def _build_site_contexts(
+        self, genotype_df: pd.DataFrame
+    ) -> Dict[Tuple[str, int, str, str], Tuple[str, str]]:
         try:
             import pysam  # type: ignore
         except Exception as exc:
@@ -509,7 +535,9 @@ class VariantFeatureBuilder:
             vectors[s] = v
 
             if i % self.log_every_seq == 0 or i == len(unique_seqs):
-                self.logger.info("Sequence embedding progress: %d/%d", i, len(unique_seqs))
+                self.logger.info(
+                    "Sequence embedding progress: %d/%d", i, len(unique_seqs)
+                )
 
         return np.vstack([vectors[s] for s in seqs]).astype(np.float32)
 
@@ -538,19 +566,29 @@ class VariantFeatureBuilder:
         all_idx = np.arange(n)
         sample_values = df["sample"].astype(str).values
         isolated_set = set(self.isolated_sample_list)
-        isolated_idx = np.array([i for i, s in enumerate(sample_values) if s in isolated_set], dtype=int)
+        isolated_idx = np.array(
+            [i for i, s in enumerate(sample_values) if s in isolated_set], dtype=int
+        )
 
         test_n = max(1, int(round(n * self.test_ratio)))
         if len(isolated_idx) > test_n:
             test_n = len(isolated_idx)
 
-        remaining_idx = np.array([i for i in all_idx if i not in set(isolated_idx)], dtype=int)
+        remaining_idx = np.array(
+            [i for i in all_idx if i not in set(isolated_idx)], dtype=int
+        )
         rng.shuffle(remaining_idx)
         extra_n = max(0, test_n - len(isolated_idx))
         extra_test_idx = remaining_idx[:extra_n]
-        test_idx = np.concatenate([isolated_idx, extra_test_idx]) if len(isolated_idx) > 0 else extra_test_idx
+        test_idx = (
+            np.concatenate([isolated_idx, extra_test_idx])
+            if len(isolated_idx) > 0
+            else extra_test_idx
+        )
 
-        trainval_idx = np.array([i for i in all_idx if i not in set(test_idx)], dtype=int)
+        trainval_idx = np.array(
+            [i for i in all_idx if i not in set(test_idx)], dtype=int
+        )
         rng.shuffle(trainval_idx)
 
         split = {
