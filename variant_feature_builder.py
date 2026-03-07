@@ -222,9 +222,20 @@ class VariantFeatureBuilder:
         self.logger.info("VCF samples=%d standardized to sample_N", len(self.samples))
 
         site_rows: Dict[Tuple[str, int], Dict] = {}
+        total_target = len(target_sites)
+        seen_records = 0
+        matched_records = 0
         for rec in vcf:
+            seen_records += 1
             key = (self._standard_chrom_name(str(rec.chrom)), int(rec.pos))
             if key not in target_sites:
+                if seen_records % 100000 == 0:
+                    self.logger.info(
+                        "VCF scan progress: seen=%d matched=%d target=%d",
+                        seen_records,
+                        matched_records,
+                        total_target,
+                    )
                 continue
             ref = str(rec.ref)
             alt = str(rec.alts[0]) if rec.alts else "N"
@@ -246,6 +257,14 @@ class VariantFeatureBuilder:
                         g = 2
                 row[self.sample_name_map[s]] = g
             site_rows[key] = row
+            matched_records += 1
+            if matched_records % 1000 == 0 or matched_records == total_target:
+                self.logger.info(
+                    "VCF match progress: matched=%d/%d (seen=%d)",
+                    matched_records,
+                    total_target,
+                    seen_records,
+                )
 
         merged = self.variant_df[["Chromosome", "Position", "Gene_id"]].copy()
         merged = merged.drop_duplicates()
@@ -268,7 +287,12 @@ class VariantFeatureBuilder:
 
         out_cols = ["Chromosome", "Position", "Ref", "Alt", "gene_name"] + self.samples
         genotype_df = merged[out_cols].copy()
-        self.logger.info("Built genotype_df: shape=%s", genotype_df.shape)
+        self.logger.info(
+            "Built genotype_df: shape=%s matched_sites=%d target_sites=%d",
+            genotype_df.shape,
+            len(site_rows),
+            total_target,
+        )
         return genotype_df
 
     def _build_geno012_df(self, genotype_df: pd.DataFrame) -> pd.DataFrame:
@@ -563,6 +587,17 @@ class VariantFeatureBuilder:
         up = core.upper()
         if up == "MT":
             core = "M"
+        elif core.isdigit():
+            # Normalize leading zeros: "01" -> "1", "000" -> "0"
+            core = str(int(core))
+        else:
+            # Handle mixed tokens like "01A" by only stripping numeric leading zeros.
+            i = 0
+            while i < len(core) and core[i].isdigit():
+                i += 1
+            if i > 0:
+                num = str(int(core[:i]))
+                core = num + core[i:]
         return f"Chr{core}"
 
     def _build_standard_chrom_map(self, chroms: List[str]) -> Dict[str, str]:
