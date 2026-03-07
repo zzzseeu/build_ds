@@ -83,7 +83,11 @@ class VariantFeatureBuilder:
         self.variant_df: pd.DataFrame | None = None
         self.genotype_df: pd.DataFrame | None = None
         self.samples: List[str] = []
+        self.sample_name_map: Dict[str, str] = {}
         self.isolated_sample_list: List[str] = []
+        self.log_every_gene = 100
+        self.log_every_feature = 500
+        self.log_every_seq = 2000
 
     # --------------------------
     # Pipeline
@@ -178,9 +182,26 @@ class VariantFeatureBuilder:
         sdf = pd.read_csv(self.sample_list_path)
         if "sample" not in sdf.columns:
             raise ValueError("sample_list_path file must contain column: sample")
-        samples = sorted(set(sdf["sample"].dropna().astype(str).tolist()))
-        self.logger.info("Loaded isolated_sample_list: n=%d", len(samples))
-        return samples
+        raw_samples = sorted(set(sdf["sample"].dropna().astype(str).tolist()))
+        standardized = []
+        unknown = []
+        for s in raw_samples:
+            if s in self.sample_name_map:
+                standardized.append(self.sample_name_map[s])
+            elif s in self.samples:
+                standardized.append(s)
+            else:
+                unknown.append(s)
+        standardized = sorted(set(standardized))
+        self.logger.info(
+            "Loaded isolated_sample_list: raw=%d standardized=%d unknown=%d",
+            len(raw_samples),
+            len(standardized),
+            len(unknown),
+        )
+        if unknown:
+            self.logger.warning("Unknown isolated samples (ignored): %s", unknown[:20])
+        return standardized
 
     # --------------------------
     # Step 2
@@ -195,8 +216,10 @@ class VariantFeatureBuilder:
         target_sites = set(zip(self.variant_df["Chromosome"], self.variant_df["Position"]))
 
         vcf = pysam.VariantFile(str(self.vcf_path))
-        self.samples = list(vcf.header.samples)
-        self.logger.info("VCF samples=%d", len(self.samples))
+        vcf_samples = list(vcf.header.samples)
+        self.sample_name_map = {s: f"sample_{i+1}" for i, s in enumerate(vcf_samples)}
+        self.samples = [self.sample_name_map[s] for s in vcf_samples]
+        self.logger.info("VCF samples=%d standardized to sample_N", len(self.samples))
 
         site_rows: Dict[Tuple[str, int], Dict] = {}
         for rec in vcf:
@@ -211,7 +234,7 @@ class VariantFeatureBuilder:
                 "Ref": ref,
                 "Alt": alt,
             }
-            for s in self.samples:
+            for s in vcf_samples:
                 gt = rec.samples[s].get("GT")
                 if gt is None or any(a is None for a in gt):
                     g = 0
@@ -221,7 +244,7 @@ class VariantFeatureBuilder:
                     g = int(sum(gt))
                     if g > 2:
                         g = 2
-                row[s] = g
+                row[self.sample_name_map[s]] = g
             site_rows[key] = row
 
         merged = self.variant_df[["Chromosome", "Position", "Gene_id"]].copy()
@@ -311,7 +334,7 @@ class VariantFeatureBuilder:
                             seq[idx] = str(r["Alt"])
                 row[s] = "".join(seq)
             gene_rows[gene_feat] = row
-            if gi % 20 == 0 or gi == len(groups):
+            if gi % self.log_every_gene == 0 or gi == len(groups):
                 self.logger.info("Gene sequence progress: %d/%d", gi, len(groups))
 
         gene_seq_by_gene = pd.DataFrame.from_dict(gene_rows, orient="index")
@@ -396,7 +419,7 @@ class VariantFeatureBuilder:
                 blocks.append(emb)
                 out_cols.extend([f"{feat}_embed_{k}" for k in range(emb.shape[1])])
 
-            if i % 200 == 0 or i == len(features):
+            if i % self.log_every_feature == 0 or i == len(features):
                 self.logger.info("Embedding progress(%s): %d/%d", name_prefix, i, len(features))
 
         out = pd.DataFrame(np.concatenate(blocks, axis=1), columns=out_cols[1:])
@@ -461,7 +484,7 @@ class VariantFeatureBuilder:
                 np.save(p, v)
             vectors[s] = v
 
-            if i % 500 == 0 or i == len(unique_seqs):
+            if i % self.log_every_seq == 0 or i == len(unique_seqs):
                 self.logger.info("Sequence embedding progress: %d/%d", i, len(unique_seqs))
 
         return np.vstack([vectors[s] for s in seqs]).astype(np.float32)
