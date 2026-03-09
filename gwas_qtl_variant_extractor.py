@@ -1,378 +1,268 @@
+"""Extract GWAS/QTL variants from VCF.
+
+All genomic coordinates are treated as 1-based.
+"""
+
 from __future__ import annotations
 
 import argparse
-import logging
-import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+import re
+from typing import Dict, Iterable, List, Set, Tuple
 
 import pandas as pd
 
-try:
-    from intervaltree import Interval, IntervalTree  # type: ignore
-except Exception as exc:  # pragma: no cover
-    raise ImportError(
-        "intervaltree is required. Please install with: pip install intervaltree"
-    ) from exc
+from logging import init_logger
 
 
-@dataclass(frozen=True)
-class IntervalRecord:
-    start: int  # 1-based inclusive
-    end: int  # 1-based inclusive
-    record_id: str
+@dataclass
+class Interval:
+    """Simple inclusive interval for 1-based coordinates."""
+
+    start: int
+    end: int
+    trait: str
+
+    def contains(self, pos: int) -> bool:
+        return self.start <= pos <= self.end
+
+
+class IntervalTree:
+    """Lightweight interval tree via sorted intervals + binary prunable scan."""
+
+    def __init__(self) -> None:
+        self.intervals: List[Interval] = []
+        self._built = False
+
+    def add(self, start: int, end: int, trait: str) -> None:
+        if start > end:
+            start, end = end, start
+        self.intervals.append(Interval(start=start, end=end, trait=trait))
+        self._built = False
+
+    def build(self) -> None:
+        self.intervals.sort(key=lambda x: (x.start, x.end))
+        self._built = True
+
+    def query_traits(self, pos: int) -> Set[str]:
+        if not self._built:
+            self.build()
+        traits: Set[str] = set()
+        for iv in self.intervals:
+            if iv.start > pos:
+                break
+            if iv.contains(pos):
+                traits.add(iv.trait)
+        return traits
 
 
 class GWASQTLVariantExtractor:
-    """
-    Extract VCF sites by GWAS/QTL intersection or union, then optionally filter by gene intervals.
-
-    All coordinates are treated as 1-based.
-    """
-
-    @staticmethod
-    def standard_chrom(chrom: str) -> str:
-        """
-        Normalize chromosome name to 'ChrN'-style.
-        Examples: '1' -> 'Chr1', 'chr1' -> 'Chr1', 'CHR01' -> 'Chr1', 'x' -> 'ChrX'.
-        """
-        s = str(chrom).strip()
-        if not s:
-            return s
-
-        s = re.sub(r"^chr", "", s, flags=re.IGNORECASE).strip()
-        if not s:
-            return "Chr"
-
-        if re.fullmatch(r"\d+", s):
-            s = str(int(s))
-        else:
-            s = s.upper()
-
-        return f"Chr{s}"
+    """Extract GWAS/QTL union or intersection sites from VCF."""
 
     def __init__(
         self,
-        gwas_path: str,
-        qtl_path: str,
+        gwas_csv_path: str,
+        qtl_csv_path: str,
+        mode: str,
         vcf_path: str,
-        type: str = "union",
-        gene_interval_path: Optional[str] = None,
-        ext_length: int = 0,
-        outdir: str = ".",
-        save_file: bool = True,
-        out_prefix: str = "gwas_qtl_sites",
-        log_level: int = logging.INFO,
-        log_file: str = "gwas_qtl_variant_extractor.log",
+        outprefix: str,
+        trait: str | None = None,
+        pvalue_threshold: float = 1e6,
+        lod_threshold: float = 2.5,
+        pve_threshold: float = 10.0,
     ) -> None:
-        self.gwas_path = Path(gwas_path)
-        self.qtl_path = Path(qtl_path)
+        mode = mode.lower().strip()
+        if mode not in {"intersect", "union"}:
+            raise ValueError("type/mode must be one of: intersect, union")
+
+        self.gwas_csv_path = Path(gwas_csv_path)
+        self.qtl_csv_path = Path(qtl_csv_path)
+        self.mode = mode
         self.vcf_path = Path(vcf_path)
-        self.type = type.lower().strip()
-        self.gene_interval_path = Path(gene_interval_path) if gene_interval_path else None
-        self.ext_length = int(ext_length)
-        self.outdir = Path(outdir)
-        self.save_file = bool(save_file)
-        self.out_prefix = out_prefix
-        self.log_file = log_file
+        self.outprefix = Path(outprefix)
+        self.trait = trait
+        self.pvalue_threshold = float(pvalue_threshold)
+        self.lod_threshold = float(lod_threshold)
+        self.pve_threshold = float(pve_threshold)
 
-        if self.type not in {"intersection", "union"}:
-            raise ValueError("type must be one of: 'intersection', 'union'")
-        if self.ext_length < 0:
-            raise ValueError("ext_length must be >= 0")
+        self.outprefix.parent.mkdir(parents=True, exist_ok=True)
+        log_path = self.outprefix.parent / f"{self.outprefix.name}_{datetime.now().strftime('%Y-%m-%d')}.log"
+        self.logger = init_logger("GWASQTLVariantExtractor", log_file=log_path)
 
-        self.outdir.mkdir(parents=True, exist_ok=True)
-        self.logger = logging.getLogger("GWASQTLVariantExtractor")
-        self.logger.setLevel(log_level)
-        self.logger.propagate = False
-        fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-        if not self.logger.handlers:
-            sh = logging.StreamHandler()
-            sh.setFormatter(fmt)
-            self.logger.addHandler(sh)
-            fh = logging.FileHandler(self.outdir / self.log_file)
-            fh.setFormatter(fmt)
-            self.logger.addHandler(fh)
-        self.logger.info("Initialized extractor")
-        self.logger.info(
-            "config: type=%s ext_length=%d save_file=%s out_prefix=%s",
-            self.type,
-            self.ext_length,
-            self.save_file,
-            self.out_prefix,
-        )
-
-    def run(self) -> pd.DataFrame:
-        self.logger.info("Run started")
-        gwas_df = self._read_gwas()
-        qtl_df = self._read_qtl()
-
-        qtl_tree = self._build_interval_tree(
-            df=qtl_df,
-            chr_col="Chromosome",
-            start_col="Start",
-            end_col="End",
-            id_col="QTL_name",
-            ext_length=0,
-        )
-
-        selected_sites = self._select_sites_from_vcf(gwas_df=gwas_df, qtl_tree=qtl_tree)
-        self.logger.info("Selected sites from VCF: n_sites=%d", len(selected_sites))
-
-        if self.gene_interval_path is not None:
-            gene_df = self._read_gene_intervals()
-            gene_tree = self._build_interval_tree(
-                df=gene_df,
-                chr_col="Chromosome",
-                start_col="Start",
-                end_col="End",
-                id_col="Gene_id",
-                ext_length=self.ext_length,
-            )
-            result_df = self._filter_by_gene_intervals(selected_sites, gene_tree)
-            self.logger.info("Gene interval filtering applied: result_shape=%s", result_df.shape)
-        else:
-            result_df = pd.DataFrame(
-                [
-                    {
-                        "Chromosome": chrom,
-                        "Position": pos,
-                        "Gene_id": pd.NA,
-                        "Gene_position": pd.NA,
-                    }
-                    for chrom, pos in sorted(selected_sites)
-                ],
-                columns=["Chromosome", "Position", "Gene_id", "Gene_position"],
-            )
-            self.logger.info("No gene interval filtering: result_shape=%s", result_df.shape)
-
-        if self.save_file:
-            out_file = self.outdir / f"{self.out_prefix}_{self.type}.csv"
-            result_df.to_csv(out_file, index=False)
-            self.logger.info("Saved output file: %s", out_file)
-
-        self.logger.info("Run finished")
-
-        return result_df
+    @staticmethod
+    def _standard_chrom(chrom: str) -> str | None:
+        c = str(chrom).strip()
+        if not c:
+            return None
+        m = re.search(r"(\\d+)", c)
+        if m is None:
+            return None
+        return f"Chr{int(m.group(1))}"
 
     def _read_gwas(self) -> pd.DataFrame:
-        df = pd.read_csv(self.gwas_path)
-        required = ["Chromosome", "Position", "Trait"]
-        self._validate_columns(df, required, "GWAS")
-        df = df[required].copy()
-        df["Chromosome"] = df["Chromosome"].map(self.standard_chrom)
+        required = ["Chromosome", "Position", "Trait", "pvalue"]
+        df = pd.read_csv(self.gwas_csv_path)
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"GWAS CSV missing columns: {missing}")
+
+        df = df.copy()
+        df["Chromosome"] = df["Chromosome"].astype(str).map(self._standard_chrom)
+        df = df[df["Chromosome"].notna()]
         df["Position"] = df["Position"].astype(int)
-        self.logger.info("Loaded GWAS: shape=%s unique_sites=%d", df.shape, df[["Chromosome", "Position"]].drop_duplicates().shape[0])
+        df["Trait"] = df["Trait"].astype(str)
+        df["pvalue"] = pd.to_numeric(df["pvalue"], errors="coerce")
+        df = df[df["pvalue"] < self.pvalue_threshold]
+        if self.trait is not None:
+            df = df[df["Trait"] == self.trait]
+
+        self.logger.info("GWAS loaded: shape=%s", df.shape)
         return df
 
     def _read_qtl(self) -> pd.DataFrame:
-        df = pd.read_csv(self.qtl_path)
-        required = ["Chromosome", "Start", "End", "Trait", "QTL_name"]
-        self._validate_columns(df, required, "QTL")
-        df = df[required].copy()
-        df["Chromosome"] = df["Chromosome"].map(self.standard_chrom)
-        df["Start"] = df["Start"].astype(int)
-        df["End"] = df["End"].astype(int)
-        self.logger.info("Loaded QTL: shape=%s", df.shape)
-        return df
-
-    def _read_gene_intervals(self) -> pd.DataFrame:
-        assert self.gene_interval_path is not None
-        df = pd.read_csv(self.gene_interval_path)
-
-        # Support files with optional extra columns.
-        required = ["Chromosome", "Start", "End", "Gene_id"]
-        self._validate_columns(df, required, "Gene interval")
-
-        df = df[required].copy()
-        df["Chromosome"] = df["Chromosome"].map(self.standard_chrom)
-        df["Start"] = df["Start"].astype(int)
-        df["End"] = df["End"].astype(int)
-        self.logger.info("Loaded gene intervals: shape=%s", df.shape)
-        return df
-
-    @staticmethod
-    def _validate_columns(df: pd.DataFrame, required: List[str], table_name: str) -> None:
+        required = ["QTL", "Chromosome", "Position", "LOD", "PVE", "start_pos", "end_pos", "Trait"]
+        df = pd.read_csv(self.qtl_csv_path)
         missing = [c for c in required if c not in df.columns]
         if missing:
-            raise ValueError(f"{table_name} file missing columns: {missing}")
+            raise ValueError(f"QTL CSV missing columns: {missing}")
 
-    def _build_interval_tree(
-        self,
-        df: pd.DataFrame,
-        chr_col: str,
-        start_col: str,
-        end_col: str,
-        id_col: str,
-        ext_length: int,
-    ) -> Dict[str, IntervalTree]:
-        tree_dict: Dict[str, IntervalTree] = {}
+        df = df.copy()
+        df["Chromosome"] = df["Chromosome"].astype(str).map(self._standard_chrom)
+        df = df[df["Chromosome"].notna()]
+        df["start_pos"] = pd.to_numeric(df["start_pos"], errors="coerce").astype("Int64")
+        df["end_pos"] = pd.to_numeric(df["end_pos"], errors="coerce").astype("Int64")
+        df["Trait"] = df["Trait"].astype(str)
+        df["LOD"] = pd.to_numeric(df["LOD"], errors="coerce")
+        df["PVE"] = pd.to_numeric(df["PVE"], errors="coerce")
 
-        for _, row in df.iterrows():
-            chrom = str(row[chr_col])
-            start = max(1, int(row[start_col]) - ext_length)
-            end = int(row[end_col]) + ext_length
-            record_id = str(row[id_col])
+        df = df[(df["LOD"] > self.lod_threshold) & (df["PVE"] > self.pve_threshold)]
+        df = df[df["start_pos"].notna() & df["end_pos"].notna()]
+        if self.trait is not None:
+            df = df[df["Trait"] == self.trait]
 
-            tree = tree_dict.setdefault(chrom, IntervalTree())
-            # intervaltree uses [begin, end), convert from 1-based inclusive to half-open
-            tree.add(Interval(start, end + 1, IntervalRecord(start=start, end=end, record_id=record_id)))
+        self.logger.info("QTL loaded: shape=%s", df.shape)
+        return df
 
-        self.logger.info("Built interval tree: n_chrom=%d n_intervals=%d", len(tree_dict), len(df))
-        return tree_dict
+    def _build_qtl_trees(self, qtl_df: pd.DataFrame) -> Dict[str, IntervalTree]:
+        trees: Dict[str, IntervalTree] = {}
+        for row in qtl_df.itertuples(index=False):
+            chrom = str(row.Chromosome)
+            start = int(row.start_pos)
+            end = int(row.end_pos)
+            trait = str(row.Trait)
+            if chrom not in trees:
+                trees[chrom] = IntervalTree()
+            trees[chrom].add(start, end, trait)
 
-    def _select_sites_from_vcf(
-        self,
-        gwas_df: pd.DataFrame,
-        qtl_tree: Dict[str, IntervalTree],
-    ) -> Set[Tuple[str, int]]:
-        gwas_sites: Set[Tuple[str, int]] = set(
-            zip(gwas_df["Chromosome"].astype(str), gwas_df["Position"].astype(int))
-        )
+        for tree in trees.values():
+            tree.build()
 
-        selected: Set[Tuple[str, int]] = set()
-
-        total = 0
-        for chrom, pos in self._iter_vcf_sites(self.vcf_path):
-            total += 1
-            in_gwas = (chrom, pos) in gwas_sites
-            in_qtl = bool(qtl_tree.get(chrom, IntervalTree()).overlap(pos, pos + 1))
-
-            if self.type == "intersection":
-                if in_gwas and in_qtl:
-                    selected.add((chrom, pos))
-            else:  # union
-                if in_gwas or in_qtl:
-                    selected.add((chrom, pos))
-            if total % 200000 == 0:
-                self.logger.info("VCF scan progress: scanned=%d selected=%d", total, len(selected))
-
-        self.logger.info("VCF scan done: scanned=%d selected=%d", total, len(selected))
-
-        return selected
-
-    def _filter_by_gene_intervals(
-        self,
-        sites: Set[Tuple[str, int]],
-        gene_tree: Dict[str, IntervalTree],
-    ) -> pd.DataFrame:
-        rows: List[Dict[str, object]] = []
-
-        for chrom, pos in sorted(sites):
-            hits = gene_tree.get(chrom, IntervalTree()).overlap(pos, pos + 1)
-            for hit in sorted(hits, key=lambda h: (h.data.start, h.data.end, h.data.record_id)):
-                rec: IntervalRecord = hit.data
-                rows.append(
-                    {
-                        "Chromosome": chrom,
-                        "Position": pos,
-                        "Gene_id": rec.record_id,
-                        "Gene_position": pos - rec.start + 1,
-                    }
-                )
-
-        out = pd.DataFrame(rows, columns=["Chromosome", "Position", "Gene_id", "Gene_position"])
-        self.logger.info("Built filtered dataframe: shape=%s", out.shape)
-        return out
+        self.logger.info("QTL interval trees built: chromosomes=%d", len(trees))
+        return trees
 
     @staticmethod
-    def _iter_vcf_sites(vcf_path: Path) -> Iterable[Tuple[str, int]]:
-        # Try pysam first (supports .vcf/.vcf.gz), fallback to text parsing.
+    def _build_gwas_site_map(gwas_df: pd.DataFrame) -> Dict[Tuple[str, int], Set[str]]:
+        site_map: Dict[Tuple[str, int], Set[str]] = {}
+        for row in gwas_df.itertuples(index=False):
+            key = (str(row.Chromosome), int(row.Position))
+            site_map.setdefault(key, set()).add(str(row.Trait))
+        return site_map
+
+    def _extract_from_vcf(
+        self,
+        gwas_site_map: Dict[Tuple[str, int], Set[str]],
+        qtl_trees: Dict[str, IntervalTree],
+    ) -> pd.DataFrame:
         try:
             import pysam  # type: ignore
+        except Exception as exc:
+            raise ImportError("pysam is required to read VCF") from exc
 
-            vcf = pysam.VariantFile(str(vcf_path))
-            for rec in vcf:
-                yield GWASQTLVariantExtractor.standard_chrom(str(rec.chrom)), int(rec.pos)
-            return
-        except Exception:
-            pass
+        rows: List[Tuple[str, int, str]] = []
+        seen = 0
+        kept = 0
 
-        open_func = open
-        if str(vcf_path).endswith(".gz"):
-            import gzip
+        vcf = pysam.VariantFile(str(self.vcf_path))
+        for rec in vcf:
+            seen += 1
+            chrom = self._standard_chrom(str(rec.chrom))
+            if chrom is None:
+                continue
+            pos = int(rec.pos)  # 1-based
+            key = (chrom, pos)
 
-            open_func = gzip.open  # type: ignore
+            g_traits = gwas_site_map.get(key, set())
+            q_traits = qtl_trees.get(chrom, IntervalTree()).query_traits(pos) if chrom in qtl_trees else set()
 
-        with open_func(vcf_path, "rt") as f:  # type: ignore
-            for line in f:
-                if not line or line.startswith("#"):
-                    continue
-                fields = line.rstrip("\n").split("\t")
-                if len(fields) < 2:
-                    continue
-                chrom = GWASQTLVariantExtractor.standard_chrom(fields[0])
-                pos = int(fields[1])
-                yield chrom, pos
+            if self.mode == "intersect":
+                traits = g_traits & q_traits
+            else:
+                traits = g_traits | q_traits
+
+            if traits:
+                kept += 1
+                for t in sorted(traits):
+                    rows.append((chrom, pos, t))
+
+            if seen % 100000 == 0:
+                self.logger.info("VCF scan progress: seen=%d kept_sites=%d", seen, kept)
+
+        out_df = pd.DataFrame(rows, columns=["Chromosome", "Position", "Trait"])
+        out_df = out_df.drop_duplicates().sort_values(["Chromosome", "Position", "Trait"]).reset_index(drop=True)
+
+        self.logger.info("VCF extraction done: seen=%d output_rows=%d", seen, len(out_df))
+        return out_df
+
+    def run(self) -> pd.DataFrame:
+        self.logger.info("Run started: mode=%s trait=%s", self.mode, self.trait)
+
+        gwas_df = self._read_gwas()
+        qtl_df = self._read_qtl()
+        qtl_trees = self._build_qtl_trees(qtl_df)
+        gwas_site_map = self._build_gwas_site_map(gwas_df)
+
+        out_df = self._extract_from_vcf(gwas_site_map, qtl_trees)
+        date_tag = datetime.now().strftime("%Y-%m-%d")
+        out_csv = self.outprefix.parent / f"{self.outprefix.name}_{date_tag}.csv"
+        out_df.to_csv(out_csv, index=False)
+
+        self.logger.info("Output saved: %s", out_csv)
+        self.logger.info("Run finished")
+        return out_df
 
 
-def _build_cli_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Extract VCF variants by GWAS/QTL union or intersection, "
-            "with optional gene-interval filtering."
-        )
-    )
-    parser.add_argument("--gwas_path", required=True, help="GWAS CSV path (Chromosome,Position,Trait)")
-    parser.add_argument("--qtl_path", required=True, help="QTL CSV path (Chromosome,Start,End,Trait,QTL_name)")
-    parser.add_argument("--vcf_path", required=True, help="VCF path (.vcf or .vcf.gz)")
-    parser.add_argument(
-        "--type",
-        default="union",
-        choices=["intersection", "union"],
-        help="How to combine GWAS and QTL sites (default: union)",
-    )
-    parser.add_argument(
-        "--gene_interval_path",
-        default=None,
-        help="Optional gene interval CSV path (Chromosome,Start,End,Gene_id)",
-    )
-    parser.add_argument(
-        "--ext_length",
-        type=int,
-        default=0,
-        help="Extend gene intervals upstream/downstream by this length (default: 0)",
-    )
-    parser.add_argument("--outdir", default=".", help="Output directory when save_file is enabled")
-    parser.add_argument("--out_prefix", default="gwas_qtl_sites", help="Output file prefix")
-    parser.add_argument("--log_file", default="gwas_qtl_variant_extractor.log", help="Log filename under outdir")
-    parser.add_argument("--log_level", default="INFO", help="Log level: DEBUG/INFO/WARNING/ERROR")
-    parser.add_argument(
-        "--save_file",
-        action="store_true",
-        default=True,
-        help="Save output CSV (default: True)",
-    )
-    parser.add_argument(
-        "--no-save_file",
-        dest="save_file",
-        action="store_false",
-        help="Do not save output file; only print result summary",
-    )
-    return parser
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Extract GWAS/QTL union or intersection variants from VCF")
+    p.add_argument("--gwas_csv_path", required=True)
+    p.add_argument("--qtl_csv_path", required=True)
+    p.add_argument("--type", required=True, choices=["intersect", "union"], dest="mode")
+    p.add_argument("--vcf_path", required=True)
+    p.add_argument("--outprefix", required=True)
+    p.add_argument("--trait", default=None)
+
+    p.add_argument("--pvalue_threshold", type=float, default=1e6)
+    p.add_argument("--LOD_threshold", type=float, default=2.5, dest="lod_threshold")
+    p.add_argument("--PVE_threshold", type=float, default=10.0, dest="pve_threshold")
+    return p
 
 
 def main() -> None:
-    parser = _build_cli_parser()
-    args = parser.parse_args()
-
+    args = build_parser().parse_args()
     extractor = GWASQTLVariantExtractor(
-        gwas_path=args.gwas_path,
-        qtl_path=args.qtl_path,
+        gwas_csv_path=args.gwas_csv_path,
+        qtl_csv_path=args.qtl_csv_path,
+        mode=args.mode,
         vcf_path=args.vcf_path,
-        type=args.type,
-        gene_interval_path=args.gene_interval_path,
-        ext_length=args.ext_length,
-        outdir=args.outdir,
-        save_file=args.save_file,
-        out_prefix=args.out_prefix,
-        log_file=args.log_file,
-        log_level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        outprefix=args.outprefix,
+        trait=args.trait,
+        pvalue_threshold=args.pvalue_threshold,
+        lod_threshold=args.lod_threshold,
+        pve_threshold=args.pve_threshold,
     )
-    out = extractor.run()
-    print(out.head())
-    print(f"rows={len(out)}")
+    out_df = extractor.run()
+    print(out_df.shape)
 
 
 if __name__ == "__main__":
