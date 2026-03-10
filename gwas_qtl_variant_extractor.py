@@ -211,7 +211,7 @@ class GWASQTLVariantExtractor:
         except Exception as exc:
             raise ImportError("pysam is required to read VCF") from exc
 
-        rows: List[Tuple[str, int, str]] = []
+        rows: List[Tuple[str, int, str, str]] = []
         seen = 0
         kept = 0
 
@@ -228,20 +228,26 @@ class GWASQTLVariantExtractor:
             q_traits = qtl_trees.get(chrom, IntervalTree()).query_traits(pos) if chrom in qtl_trees else set()
 
             if self.type == "intersect":
-                traits = g_traits & q_traits
+                keep_site = bool(g_traits & q_traits)
             else:
-                traits = g_traits | q_traits
+                keep_site = bool(g_traits or q_traits)
 
-            if traits:
+            if keep_site:
                 kept += 1
-                for t in sorted(traits):
-                    rows.append((chrom, pos, t))
+                rows.append(
+                    (
+                        chrom,
+                        pos,
+                        ",".join(sorted(g_traits)),
+                        ",".join(sorted(q_traits)),
+                    )
+                )
 
             if seen % 100000 == 0:
                 self.logger.info("VCF scan progress: seen=%d kept_sites=%d", seen, kept)
 
-        out_df = pd.DataFrame(rows, columns=["Chromosome", "Position", "Trait"])
-        out_df = out_df.drop_duplicates().sort_values(["Chromosome", "Position", "Trait"]).reset_index(drop=True)
+        out_df = pd.DataFrame(rows, columns=["Chromosome", "Position", "gwas_trait", "qtl_trait"])
+        out_df = out_df.drop_duplicates().sort_values(["Chromosome", "Position", "gwas_trait", "qtl_trait"]).reset_index(drop=True)
 
         self.logger.info("VCF extraction done: seen=%d output_rows=%d", seen, len(out_df))
         return out_df
@@ -300,7 +306,7 @@ class GWASQTLVariantExtractor:
         if feature_trees is None:
             return site_df
 
-        rows: list[tuple[str, int, str]] = []
+        rows: list[tuple[str, int, str, str, str]] = []
         for row in site_df.itertuples(index=False):
             hits = query_feature_interval_trees(
                 interval_trees=feature_trees,
@@ -310,10 +316,20 @@ class GWASQTLVariantExtractor:
             if not hits:
                 continue
             for hit in hits:
-                rows.append((str(row.Chromosome), int(row.Position), self._feature_label(hit)))
+                rows.append(
+                    (
+                        str(row.Chromosome),
+                        int(row.Position),
+                        self._feature_label(hit),
+                        str(row.gwas_trait),
+                        str(row.qtl_trait),
+                    )
+                )
 
-        out_df = pd.DataFrame(rows, columns=["Chromosome", "Position", "Gene"])
-        out_df = out_df.drop_duplicates().sort_values(["Chromosome", "Position", "Gene"]).reset_index(drop=True)
+        out_df = pd.DataFrame(rows, columns=["Chromosome", "Position", "Gene", "gwas_trait", "qtl_trait"])
+        out_df = out_df.drop_duplicates().sort_values(
+            ["Chromosome", "Position", "Gene", "gwas_trait", "qtl_trait"]
+        ).reset_index(drop=True)
         self.logger.info("Feature-filtered output built: rows=%d", len(out_df))
         return out_df
 
