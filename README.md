@@ -6,15 +6,22 @@
 
 ### 1) `gwas_qtl_variant_extractor.py`
 - 作用：
-  - 读取 GWAS 位点和 QTL 区间；
-  - 根据 `intersection/union` 与 VCF 位点整合；
-  - 可选按基因区间过滤；
-  - 输出标准位点表（1-based）。
-- 核心输出列：
-  - `Chromosome`
-  - `Position`
-  - `Gene_id`
-  - `Gene_position`
+  - 读取 GWAS 位点表与 QTL 区间表；
+  - 使用 QTL 区间构建按染色体组织的 interval tree；
+  - 在 VCF 位点上计算 GWAS 与 QTL 的 `intersect/union`；
+  - 支持按 `Trait` 与阈值过滤（`pvalue/LOD/PVE`）；
+  - 坐标统一按 1-based 输出。
+- 输入参数（CLI）：
+  - 必需：`--gwas_csv_path --qtl_csv_path --type --vcf_path --outprefix`
+  - 可选：`--trait --pvalue_threshold --LOD_threshold --PVE_threshold`
+- 输出文件：
+  - `{outprefix}_{YYYY-MM-DD}.csv`
+  - 列为：`Chromosome, Position, Trait`
+- 输入文件格式：
+  - GWAS CSV 必需列：`Chromosome, Position, Trait, pvalue`
+  - QTL CSV 必需列：`QTL, Chromosome, LOD, PVE, start_pos, end_pos, Trait`
+  - `Chromosome` 会做标准化（如 `1/chr1/chr01/chr_01 -> Chr1`），仅保留数字染色体
+  - `Position/start_pos/end_pos` 均按 1-based 处理
 
 ### 2) `variant_feature_builder.py`
 - 作用：
@@ -53,7 +60,7 @@ pip install pandas numpy pysam intervaltree scikit-learn transformers
 - 必需列：`Chromosome, Position, Trait`
 
 ### QTL 文件（CSV）
-- 必需列：`Chromosome, Start, End, Trait, QTL_name`
+- 必需列：`QTL, Chromosome, LOD, PVE, start_pos, end_pos, Trait`
 
 ### 基因区间文件（CSV，可选）
 - 必需列：`Chromosome, Start, End, Gene_id`
@@ -70,22 +77,23 @@ pip install pandas numpy pysam intervaltree scikit-learn transformers
 
 ## 使用示例
 
-## A. 位点整合与过滤（GWAS + QTL）
+## A. 位点整合（GWAS + QTL）
 
 ```bash
 conda run -n py-bioinfo python /path/to/project/gwas_qtl_variant_extractor.py \
-  --gwas_path /path/to/project/test_inputs/gwas_sites.csv \
-  --qtl_path /path/to/project/test_inputs/qtl_intervals.csv \
+  --gwas_csv_path /path/to/project/test_inputs/gwas.csv \
+  --qtl_csv_path /path/to/project/test_inputs/qtl.csv \
   --vcf_path /path/to/project/test_inputs/variants.vcf \
   --type union \
-  --gene_interval_path /path/to/project/test_inputs/gene_intervals.csv \
-  --ext_length 0 \
-  --outdir /path/to/project/test_outputs \
-  --out_prefix demo
+  --outprefix /path/to/project/test_outputs/demo_sites \
+  --trait Yield \
+  --pvalue_threshold 1e-6 \
+  --LOD_threshold 2.5 \
+  --PVE_threshold 10
 ```
 
 输出示例文件：
-- `/path/to/project/test_outputs/demo_union.csv`
+- `/path/to/project/test_outputs/demo_sites_YYYY-MM-DD.csv`
 
 ## B. 构建特征数据集（CLI）
 

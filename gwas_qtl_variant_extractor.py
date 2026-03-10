@@ -96,7 +96,7 @@ class GWASQTLVariantExtractor:
         c = str(chrom).strip()
         if not c:
             return None
-        m = re.search(r"(\\d+)", c)
+        m = re.search(r"(\d+)", c)
         if m is None:
             return None
         return f"Chr{int(m.group(1))}"
@@ -122,7 +122,7 @@ class GWASQTLVariantExtractor:
         return df
 
     def _read_qtl(self) -> pd.DataFrame:
-        required = ["QTL", "Chromosome", "Position", "LOD", "PVE", "start_pos", "end_pos", "Trait"]
+        required = ["QTL", "Chromosome", "LOD", "PVE", "start_pos", "end_pos", "Trait"]
         df = pd.read_csv(self.qtl_csv_path)
         missing = [c for c in required if c not in df.columns]
         if missing:
