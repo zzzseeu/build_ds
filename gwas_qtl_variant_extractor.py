@@ -83,6 +83,7 @@ class GWASQTLVariantExtractor:
         self.vcf_path = Path(vcf_path)
         self.outprefix = Path(outprefix)
         self.trait = trait
+        self.trait_set = self._parse_trait_filter(trait)
         self.pvalue_threshold = float(pvalue_threshold)
         self.lod_threshold = float(lod_threshold)
         self.pve_threshold = float(pve_threshold)
@@ -90,6 +91,16 @@ class GWASQTLVariantExtractor:
         self.outprefix.parent.mkdir(parents=True, exist_ok=True)
         log_path = self.outprefix.parent / f"{self.outprefix.name}_{datetime.now().strftime('%Y-%m-%d')}.log"
         self.logger = init_logger("GWASQTLVariantExtractor", log_file=log_path)
+
+    @staticmethod
+    def _parse_trait_filter(trait: str | None) -> Set[str] | None:
+        if trait is None:
+            return None
+        items = [x.strip() for x in str(trait).split(",")]
+        items = [x for x in items if x]
+        if not items:
+            return None
+        return set(items)
 
     @staticmethod
     def _standard_chrom(chrom: str) -> str | None:
@@ -115,8 +126,8 @@ class GWASQTLVariantExtractor:
         df["Trait"] = df["Trait"].astype(str)
         df["pvalue"] = pd.to_numeric(df["pvalue"], errors="coerce")
         df = df[df["pvalue"] < self.pvalue_threshold]
-        if self.trait is not None:
-            df = df[df["Trait"] == self.trait]
+        if self.trait_set is not None:
+            df = df[df["Trait"].isin(self.trait_set)]
 
         self.logger.info("GWAS loaded: shape=%s", df.shape)
         return df
@@ -139,8 +150,8 @@ class GWASQTLVariantExtractor:
 
         df = df[(df["LOD"] > self.lod_threshold) & (df["PVE"] > self.pve_threshold)]
         df = df[df["start_pos"].notna() & df["end_pos"].notna()]
-        if self.trait is not None:
-            df = df[df["Trait"] == self.trait]
+        if self.trait_set is not None:
+            df = df[df["Trait"].isin(self.trait_set)]
 
         self.logger.info("QTL loaded: shape=%s", df.shape)
         return df
@@ -216,7 +227,7 @@ class GWASQTLVariantExtractor:
         return out_df
 
     def run(self) -> pd.DataFrame:
-        self.logger.info("Run started: mode=%s trait=%s", self.mode, self.trait)
+        self.logger.info("Run started: mode=%s trait_filter=%s", self.mode, sorted(self.trait_set) if self.trait_set else None)
 
         gwas_df = self._read_gwas()
         qtl_df = self._read_qtl()
@@ -240,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--type", required=True, choices=["intersect", "union"], dest="mode")
     p.add_argument("--vcf_path", required=True)
     p.add_argument("--outprefix", required=True)
-    p.add_argument("--trait", default=None)
+    p.add_argument("--trait", default=None, help="Single trait or comma-separated traits, e.g. Yield or Yield,Height")
 
     p.add_argument("--pvalue_threshold", type=float, default=1e6)
     p.add_argument("--LOD_threshold", type=float, default=2.5, dest="lod_threshold")

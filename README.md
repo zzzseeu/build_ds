@@ -14,6 +14,7 @@
 - 输入参数（CLI）：
   - 必需：`--gwas_csv_path --qtl_csv_path --type --vcf_path --outprefix`
   - 可选：`--trait --pvalue_threshold --LOD_threshold --PVE_threshold`
+  - `--trait` 支持单个 trait 或逗号分隔多个 trait（例如 `Yield` 或 `Yield,Height`）
 - 输出文件：
   - `{outprefix}_{YYYY-MM-DD}.csv`
   - 列为：`Chromosome, Position, Trait`
