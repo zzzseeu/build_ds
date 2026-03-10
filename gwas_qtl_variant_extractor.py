@@ -9,12 +9,17 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import re
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 import pandas as pd
 
 from logging import init_logger
+from utils import (
+    extract_gff3_feature_interval_trees,
+    extract_gff3_feature_interval_trees_gffutils,
+    query_feature_interval_trees,
+    standard_chrom,
+)
 
 
 @dataclass
@@ -67,11 +72,16 @@ class GWASQTLVariantExtractor:
         qtl_csv_path: str,
         mode: str,
         vcf_path: str,
+        gff3_path: str,
         outprefix: str,
         trait: str | None = None,
         pvalue_threshold: float = 1e6,
         lod_threshold: float = 2.5,
         pve_threshold: float = 10.0,
+        gff3_feature: str = "gene",
+        ext_len: int = 500,
+        use_gffutils: bool = True,
+        gene_list: str | None = None,
     ) -> None:
         mode = mode.lower().strip()
         if mode not in {"intersect", "union"}:
@@ -81,12 +91,17 @@ class GWASQTLVariantExtractor:
         self.qtl_csv_path = Path(qtl_csv_path)
         self.mode = mode
         self.vcf_path = Path(vcf_path)
+        self.gff3_path = Path(gff3_path)
         self.outprefix = Path(outprefix)
         self.trait = trait
         self.trait_set = self._parse_trait_filter(trait)
+        self.gene_set = self._parse_gene_filter(gene_list)
         self.pvalue_threshold = float(pvalue_threshold)
         self.lod_threshold = float(lod_threshold)
         self.pve_threshold = float(pve_threshold)
+        self.gff3_feature = gff3_feature
+        self.ext_len = int(ext_len)
+        self.use_gffutils = bool(use_gffutils)
 
         self.outprefix.parent.mkdir(parents=True, exist_ok=True)
         log_path = self.outprefix.parent / f"{self.outprefix.name}_{datetime.now().strftime('%Y-%m-%d')}.log"
@@ -103,14 +118,19 @@ class GWASQTLVariantExtractor:
         return set(items)
 
     @staticmethod
-    def _standard_chrom(chrom: str) -> str | None:
-        c = str(chrom).strip()
-        if not c:
+    def _parse_feature_filter(feature: str) -> list[str]:
+        items = [x.strip() for x in str(feature).split(",")]
+        return [x for x in items if x]
+
+    @staticmethod
+    def _parse_gene_filter(gene_list: str | None) -> Set[str] | None:
+        if gene_list is None:
             return None
-        m = re.search(r"(\d+)", c)
-        if m is None:
+        items = [x.strip() for x in str(gene_list).split(",")]
+        items = [x for x in items if x]
+        if not items:
             return None
-        return f"Chr{int(m.group(1))}"
+        return set(items)
 
     def _read_gwas(self) -> pd.DataFrame:
         required = ["Chromosome", "Position", "Trait", "pvalue"]
@@ -120,7 +140,7 @@ class GWASQTLVariantExtractor:
             raise ValueError(f"GWAS CSV missing columns: {missing}")
 
         df = df.copy()
-        df["Chromosome"] = df["Chromosome"].astype(str).map(self._standard_chrom)
+        df["Chromosome"] = df["Chromosome"].astype(str).map(standard_chrom)
         df = df[df["Chromosome"].notna()]
         df["Position"] = df["Position"].astype(int)
         df["Trait"] = df["Trait"].astype(str)
@@ -140,7 +160,7 @@ class GWASQTLVariantExtractor:
             raise ValueError(f"QTL CSV missing columns: {missing}")
 
         df = df.copy()
-        df["Chromosome"] = df["Chromosome"].astype(str).map(self._standard_chrom)
+        df["Chromosome"] = df["Chromosome"].astype(str).map(standard_chrom)
         df = df[df["Chromosome"].notna()]
         df["start_pos"] = pd.to_numeric(df["start_pos"], errors="coerce").astype("Int64")
         df["end_pos"] = pd.to_numeric(df["end_pos"], errors="coerce").astype("Int64")
@@ -198,7 +218,7 @@ class GWASQTLVariantExtractor:
         vcf = pysam.VariantFile(str(self.vcf_path))
         for rec in vcf:
             seen += 1
-            chrom = self._standard_chrom(str(rec.chrom))
+            chrom = standard_chrom(str(rec.chrom))
             if chrom is None:
                 continue
             pos = int(rec.pos)  # 1-based
@@ -226,6 +246,77 @@ class GWASQTLVariantExtractor:
         self.logger.info("VCF extraction done: seen=%d output_rows=%d", seen, len(out_df))
         return out_df
 
+    def _build_feature_trees(self) -> dict[str, object] | None:
+        features = self._parse_feature_filter(self.gff3_feature)
+        if not features:
+            raise ValueError("gff3_feature must contain at least one feature name")
+
+        if self.use_gffutils:
+            trees = extract_gff3_feature_interval_trees_gffutils(
+                gff3_path=self.gff3_path,
+                feature=features,
+                ext_len=self.ext_len,
+            )
+        else:
+            trees = extract_gff3_feature_interval_trees(
+                gff3_path=self.gff3_path,
+                feature=features,
+                ext_len=self.ext_len,
+            )
+
+        self.logger.info(
+            "Feature interval trees built: chromosomes=%d features=%s ext_len=%d backend=%s",
+            len(trees),
+            features,
+            self.ext_len,
+            "gffutils" if self.use_gffutils else "text",
+        )
+        return trees
+
+    def _filter_by_gene_list(self, site_df: pd.DataFrame) -> pd.DataFrame:
+        if self.gene_set is None:
+            return site_df
+        out_df = site_df[site_df["Gene"].astype(str).isin(self.gene_set)].copy()
+        self.logger.info(
+            "Gene-list filtered output built: rows=%d genes=%d",
+            len(out_df),
+            out_df["Gene"].nunique() if not out_df.empty else 0,
+        )
+        return out_df
+
+    @staticmethod
+    def _feature_label(hit: dict[str, str | int]) -> str:
+        name = str(hit.get("name", "")).strip()
+        feature_id = str(hit.get("id", "")).strip()
+        parent = str(hit.get("parent", "")).strip()
+        feature = str(hit.get("feature", "")).strip()
+        return name or feature_id or parent or feature
+
+    def _filter_sites_by_feature_trees(
+        self,
+        site_df: pd.DataFrame,
+        feature_trees: dict[str, object] | None,
+    ) -> pd.DataFrame:
+        if feature_trees is None:
+            return site_df
+
+        rows: list[tuple[str, int, str]] = []
+        for row in site_df.itertuples(index=False):
+            hits = query_feature_interval_trees(
+                interval_trees=feature_trees,
+                chromosome=str(row.Chromosome),
+                position=int(row.Position),
+            )
+            if not hits:
+                continue
+            for hit in hits:
+                rows.append((str(row.Chromosome), int(row.Position), self._feature_label(hit)))
+
+        out_df = pd.DataFrame(rows, columns=["Chromosome", "Position", "Gene"])
+        out_df = out_df.drop_duplicates().sort_values(["Chromosome", "Position", "Gene"]).reset_index(drop=True)
+        self.logger.info("Feature-filtered output built: rows=%d", len(out_df))
+        return out_df
+
     def run(self) -> pd.DataFrame:
         self.logger.info("Run started: mode=%s trait_filter=%s", self.mode, sorted(self.trait_set) if self.trait_set else None)
 
@@ -233,8 +324,11 @@ class GWASQTLVariantExtractor:
         qtl_df = self._read_qtl()
         qtl_trees = self._build_qtl_trees(qtl_df)
         gwas_site_map = self._build_gwas_site_map(gwas_df)
+        feature_trees = self._build_feature_trees()
 
         out_df = self._extract_from_vcf(gwas_site_map, qtl_trees)
+        out_df = self._filter_sites_by_feature_trees(out_df, feature_trees)
+        out_df = self._filter_by_gene_list(out_df)
         date_tag = datetime.now().strftime("%Y-%m-%d")
         out_csv = self.outprefix.parent / f"{self.outprefix.name}_{date_tag}.csv"
         out_df.to_csv(out_csv, index=False)
@@ -250,12 +344,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--qtl_csv_path", required=True)
     p.add_argument("--type", required=True, choices=["intersect", "union"], dest="mode")
     p.add_argument("--vcf_path", required=True)
+    p.add_argument("--gff3_path", required=True)
     p.add_argument("--outprefix", required=True)
     p.add_argument("--trait", default=None, help="Single trait or comma-separated traits, e.g. Yield or Yield,Height")
-
     p.add_argument("--pvalue_threshold", type=float, default=1e6)
     p.add_argument("--LOD_threshold", type=float, default=2.5, dest="lod_threshold")
     p.add_argument("--PVE_threshold", type=float, default=10.0, dest="pve_threshold")
+    p.add_argument("--gff3_feature", default="gene", help="Single feature or comma-separated features, e.g. gene or gene,exon")
+    p.add_argument("--ext_len", type=int, default=500)
+    p.add_argument("--gene_list", default=None, help="Comma-separated gene names or IDs to keep in final output")
+    p.add_argument("--use_gffutils", action="store_true", default=True)
+    p.add_argument("--no-use_gffutils", dest="use_gffutils", action="store_false")
     return p
 
 
@@ -266,11 +365,16 @@ def main() -> None:
         qtl_csv_path=args.qtl_csv_path,
         mode=args.mode,
         vcf_path=args.vcf_path,
+        gff3_path=args.gff3_path,
         outprefix=args.outprefix,
         trait=args.trait,
         pvalue_threshold=args.pvalue_threshold,
         lod_threshold=args.lod_threshold,
         pve_threshold=args.pve_threshold,
+        gff3_feature=args.gff3_feature,
+        ext_len=args.ext_len,
+        use_gffutils=args.use_gffutils,
+        gene_list=args.gene_list,
     )
     out_df = extractor.run()
     print(out_df.shape)

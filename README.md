@@ -9,18 +9,24 @@
   - 读取 GWAS 位点表与 QTL 区间表；
   - 使用 QTL 区间构建按染色体组织的 interval tree；
   - 在 VCF 位点上计算 GWAS 与 QTL 的 `intersect/union`；
-  - 支持按 `Trait` 与阈值过滤（`pvalue/LOD/PVE`）；
+  - 将候选位点固定映射到 `gff3` 给定 feature 区间上；
+  - 支持按 `Trait`、`Gene` 与阈值过滤（`pvalue/LOD/PVE`）；
   - 坐标统一按 1-based 输出。
 - 输入参数（CLI）：
-  - 必需：`--gwas_csv_path --qtl_csv_path --type --vcf_path --outprefix`
-  - 可选：`--trait --pvalue_threshold --LOD_threshold --PVE_threshold`
+  - 必需：`--gwas_csv_path --qtl_csv_path --type --vcf_path --gff3_path --outprefix`
+  - 可选：`--trait --pvalue_threshold --LOD_threshold --PVE_threshold --gff3_feature --ext_len --gene_list --use_gffutils/--no-use_gffutils`
   - `--trait` 支持单个 trait 或逗号分隔多个 trait（例如 `Yield` 或 `Yield,Height`）
+  - `--gene_list` 支持逗号分隔多个基因名或基因 ID（例如 `GeneA,GeneB`）
+  - `--gff3_feature` 支持单个或逗号分隔多个 feature（默认 `gene`）
+  - `--ext_len` 表示区间上下游扩展长度，默认 `500`
+  - `--use_gffutils` 默认开启，使用 `gffutils` 解析 `gff3`
 - 输出文件：
   - `{outprefix}_{YYYY-MM-DD}.csv`
-  - 列为：`Chromosome, Position, Trait`
+  - 列为：`Chromosome, Position, Gene`
 - 输入文件格式：
   - GWAS CSV 必需列：`Chromosome, Position, Trait, pvalue`
   - QTL CSV 必需列：`QTL, Chromosome, LOD, PVE, start_pos, end_pos, Trait`
+  - GFF3：用于将候选位点映射到给定 feature 区间上，若一个位点落在多个基因区间内，则输出中保留多行
   - `Chromosome` 会做标准化（如 `1/chr1/chr01/chr_01 -> Chr1`），仅保留数字染色体
   - `Position/start_pos/end_pos` 均按 1-based 处理
 
@@ -44,6 +50,22 @@
 - 作用：具体模型加载实现（Rice8k/NT/Evo2 等）。
 - `variant_feature_builder.py` 内已集成 `UnifiedEmbedder` 接口，会调用本文件中的模型类。
 
+### 4) `utils.py`
+- 作用：
+  - 提供染色体名称标准化函数；
+  - 提供 `gff3` 纯文本解析与 `gffutils` 解析；
+  - 提供 feature 区间表到区间树的转换；
+  - 提供按 `chromosome + position` 查询命中区间的方法。
+- 主要函数：
+  - `standard_chrom`
+  - `parse_gff3_attributes`
+  - `extract_gff3_feature_intervals`
+  - `extract_gff3_feature_intervals_gffutils`
+  - `build_feature_interval_trees`
+  - `extract_gff3_feature_interval_trees`
+  - `extract_gff3_feature_interval_trees_gffutils`
+  - `query_feature_interval_trees`
+
 ## 依赖
 
 推荐在 `py-bioinfo` 环境中安装：
@@ -58,7 +80,7 @@ pip install pandas numpy pysam intervaltree scikit-learn transformers
 ## 输入数据格式
 
 ### GWAS 文件（CSV）
-- 必需列：`Chromosome, Position, Trait`
+- 必需列：`Chromosome, Position, Trait, pvalue`
 
 ### QTL 文件（CSV）
 - 必需列：`QTL, Chromosome, LOD, PVE, start_pos, end_pos, Trait`
@@ -85,16 +107,25 @@ conda run -n py-bioinfo python /path/to/project/gwas_qtl_variant_extractor.py \
   --gwas_csv_path /path/to/project/test_inputs/gwas.csv \
   --qtl_csv_path /path/to/project/test_inputs/qtl.csv \
   --vcf_path /path/to/project/test_inputs/variants.vcf \
+  --gff3_path /path/to/project/test_inputs/annotation.gff3 \
   --type union \
   --outprefix /path/to/project/test_outputs/demo_sites \
-  --trait Yield \
+  --trait Yield,Height \
   --pvalue_threshold 1e-6 \
   --LOD_threshold 2.5 \
-  --PVE_threshold 10
+  --PVE_threshold 10 \
+  --gff3_feature gene \
+  --ext_len 500 \
+  --gene_list GeneA,GeneB \
+  --use_gffutils
 ```
 
 输出示例文件：
 - `/path/to/project/test_outputs/demo_sites_YYYY-MM-DD.csv`
+
+说明：
+- 输出结果是候选位点映射到基因区间后的结果，列为 `Chromosome, Position, Gene`
+- 若同一位点同时命中多个基因区间，则输出多行
 
 ## B. 构建特征数据集（CLI）
 
@@ -155,6 +186,64 @@ builder = VariantFeatureBuilder(
 outputs = builder.run()
 print(outputs["genotype_012"].shape)
 print(outputs["gene_pca"].shape)
+```
+
+## D. `utils.py` 使用示例
+
+### 染色体标准化
+
+```python
+from utils import standard_chrom
+
+print(standard_chrom("1"))       # Chr1
+print(standard_chrom("chr01"))   # Chr1
+print(standard_chrom("chr_02"))  # Chr2
+```
+
+### 纯文本解析 GFF3 feature 区间
+
+```python
+from utils import extract_gff3_feature_intervals
+
+gene_df = extract_gff3_feature_intervals(
+    gff3_path="/path/to/project/test_inputs/annotation.gff3",
+    feature=["gene", "exon"],
+)
+print(gene_df.head())
+```
+
+### 使用 `gffutils` 解析 GFF3 feature 区间
+
+```python
+from utils import extract_gff3_feature_intervals_gffutils
+
+gene_df = extract_gff3_feature_intervals_gffutils(
+    gff3_path="/path/to/project/test_inputs/annotation.gff3",
+    feature="gene",
+)
+print(gene_df.head())
+```
+
+### 构建 feature 区间树并查询位点
+
+```python
+from utils import (
+    extract_gff3_feature_interval_trees_gffutils,
+    query_feature_interval_trees,
+)
+
+trees = extract_gff3_feature_interval_trees_gffutils(
+    gff3_path="/path/to/project/test_inputs/annotation.gff3",
+    feature="gene",
+    ext_len=500,
+)
+
+hits = query_feature_interval_trees(
+    interval_trees=trees,
+    chromosome="chr01",
+    position=123456,
+)
+print(hits)
 ```
 
 ## 输出列命名约定
