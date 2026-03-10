@@ -70,7 +70,7 @@ class GWASQTLVariantExtractor:
         self,
         gwas_csv_path: str,
         qtl_csv_path: str,
-        mode: str,
+        type: str,
         vcf_path: str,
         gff3_path: str,
         outprefix: str,
@@ -83,13 +83,13 @@ class GWASQTLVariantExtractor:
         use_gffutils: bool = True,
         gene_list: str | None = None,
     ) -> None:
-        mode = mode.lower().strip()
-        if mode not in {"intersect", "union"}:
-            raise ValueError("type/mode must be one of: intersect, union")
+        type = type.lower().strip()
+        if type not in {"intersect", "union"}:
+            raise ValueError("type must be one of: intersect, union")
 
         self.gwas_csv_path = Path(gwas_csv_path)
         self.qtl_csv_path = Path(qtl_csv_path)
-        self.mode = mode
+        self.type = type
         self.vcf_path = Path(vcf_path)
         self.gff3_path = Path(gff3_path)
         self.outprefix = Path(outprefix)
@@ -227,7 +227,7 @@ class GWASQTLVariantExtractor:
             g_traits = gwas_site_map.get(key, set())
             q_traits = qtl_trees.get(chrom, IntervalTree()).query_traits(pos) if chrom in qtl_trees else set()
 
-            if self.mode == "intersect":
+            if self.type == "intersect":
                 traits = g_traits & q_traits
             else:
                 traits = g_traits | q_traits
@@ -318,7 +318,7 @@ class GWASQTLVariantExtractor:
         return out_df
 
     def run(self) -> pd.DataFrame:
-        self.logger.info("Run started: mode=%s trait_filter=%s", self.mode, sorted(self.trait_set) if self.trait_set else None)
+        self.logger.info("Run started: type=%s trait_filter=%s", self.type, sorted(self.trait_set) if self.trait_set else None)
 
         gwas_df = self._read_gwas()
         qtl_df = self._read_qtl()
@@ -342,9 +342,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Extract GWAS/QTL union or intersection variants from VCF")
     p.add_argument("--gwas_csv_path", required=True)
     p.add_argument("--qtl_csv_path", required=True)
-    p.add_argument("--type", required=True, choices=["intersect", "union"], dest="mode")
+    p.add_argument("--type", required=True, choices=["intersect", "union"])
     p.add_argument("--vcf_path", required=True)
-    p.add_argument("--gff3_path", required=True)
+    p.add_argument("--gff3_path", required=True, help="Annotation path in GFF3 or GTF format")
     p.add_argument("--outprefix", required=True)
     p.add_argument("--trait", default=None, help="Single trait or comma-separated traits, e.g. Yield or Yield,Height")
     p.add_argument("--pvalue_threshold", type=float, default=1e6)
@@ -363,7 +363,7 @@ def main() -> None:
     extractor = GWASQTLVariantExtractor(
         gwas_csv_path=args.gwas_csv_path,
         qtl_csv_path=args.qtl_csv_path,
-        mode=args.mode,
+        type=args.type,
         vcf_path=args.vcf_path,
         gff3_path=args.gff3_path,
         outprefix=args.outprefix,

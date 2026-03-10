@@ -43,12 +43,12 @@ def standard_chrom(chrom: str) -> str | None:
 
 
 def parse_gff3_attributes(attr_text: str) -> dict[str, str]:
-    """Parse the GFF3 attribute column into a dictionary.
+    """Parse the GFF3 or GTF attribute column into a dictionary.
 
     Parameters
     ----------
     attr_text : str
-        Raw attribute text from the 9th GFF3 column.
+        Raw attribute text from the 9th annotation column.
 
     Returns
     -------
@@ -66,7 +66,7 @@ def parse_gff3_attributes(attr_text: str) -> dict[str, str]:
         if "=" in item:
             key, value = item.split("=", 1)
         elif " " in item:
-            # Fallback for malformed GFF3 / GTF-like fragments.
+            # Support common GTF fragments such as gene_id "X".
             key, value = item.split(" ", 1)
         else:
             continue
@@ -92,6 +92,23 @@ def _normalize_feature_set(feature: str | Iterable[str]) -> set[str]:
     return {str(x).strip() for x in feature if str(x).strip()}
 
 
+def _annotation_db_path(annotation_path: Path) -> Path:
+    """Build the default gffutils SQLite path for an annotation file."""
+    return annotation_path.with_suffix(annotation_path.suffix + ".gffutils.db")
+
+
+def _build_feature_labels(attrs: dict[str, str]) -> dict[str, str]:
+    """Build unified labels for both GFF3 and GTF attributes."""
+    feature_id = attrs.get("ID") or attrs.get("gene_id") or attrs.get("transcript_id") or ""
+    feature_name = attrs.get("Name") or attrs.get("gene_name") or attrs.get("gene_id") or feature_id
+    parent = attrs.get("Parent") or attrs.get("transcript_id") or attrs.get("gene_id") or ""
+    return {
+        "ID": feature_id,
+        "Name": feature_name,
+        "Parent": parent,
+    }
+
+
 def _parse_gff3_record_line(line: str) -> dict[str, str] | None:
     """Parse one text GFF3 record line into a column dictionary."""
     stripped = line.strip()
@@ -108,15 +125,15 @@ def extract_gff3_feature_intervals(
     gff3_path: str | Path,
     feature: str | Iterable[str],
 ) -> pd.DataFrame:
-    """Extract intervals for one or more target features from a GFF3 file.
+    """Extract intervals for one or more target features from a GFF3 or GTF file.
 
-    All coordinates are kept in the original GFF3 convention, which is 1-based
-    and closed on both ends.
+    All coordinates are kept in the original annotation-file convention, which
+    is 1-based and closed on both ends.
 
     Parameters
     ----------
     gff3_path : str | Path
-        Path to the input GFF3 file.
+        Path to the input GFF3 or GTF file.
     feature : str | Iterable[str]
         Target feature name or a collection of feature names, for example
         ``gene`` or ``[\"gene\", \"exon\"]``.
@@ -146,6 +163,7 @@ def extract_gff3_feature_intervals(
                 continue
 
             attrs = parse_gff3_attributes(str(record["attributes"]))
+            labels = _build_feature_labels(attrs)
             try:
                 start = int(record["start"])
                 end = int(record["end"])
@@ -159,9 +177,9 @@ def extract_gff3_feature_intervals(
                     "End": end,
                     "Feature": record_type,
                     "Strand": str(record["strand"]),
-                    "ID": attrs.get("ID", ""),
-                    "Name": attrs.get("Name", ""),
-                    "Parent": attrs.get("Parent", ""),
+                    "ID": labels["ID"],
+                    "Name": labels["Name"],
+                    "Parent": labels["Parent"],
                     "Attributes": str(record["attributes"]),
                 }
             )
@@ -188,7 +206,7 @@ def extract_gff3_feature_intervals_gffutils(
     db_path: str | Path | None = None,
     force_rebuild: bool = False,
 ) -> pd.DataFrame:
-    """Extract target feature intervals from a GFF3 file with ``gffutils``.
+    """Extract target feature intervals from a GFF3 or GTF file with ``gffutils``.
 
     This function builds or reuses a local ``gffutils`` database, then queries
     one or more feature types such as ``gene`` or ``exon``. Coordinates remain
@@ -197,12 +215,12 @@ def extract_gff3_feature_intervals_gffutils(
     Parameters
     ----------
     gff3_path : str | Path
-        Path to the input GFF3 file.
+        Path to the input GFF3 or GTF file.
     feature : str | Iterable[str]
         Target feature name or feature collection.
     db_path : str | Path | None
         Optional path to the generated ``gffutils`` SQLite database. When
-        omitted, a sidecar database named ``<gff3>.gffutils.db`` is used.
+        omitted, a sidecar database named ``<annotation>.gffutils.db`` is used.
     force_rebuild : bool
         Whether to rebuild the database even if it already exists.
 
@@ -224,30 +242,34 @@ def extract_gff3_feature_intervals_gffutils(
         feature_list = [str(x) for x in feature]
 
     if db_path is None:
-        db_path = gff3_path.with_suffix(gff3_path.suffix + ".gffutils.db")
+        db_path = _annotation_db_path(gff3_path)
     db_path = Path(db_path)
 
     if force_rebuild and db_path.exists():
         db_path.unlink()
 
     if not db_path.exists():
-        gffutils.create_db(
-            str(gff3_path),
-            dbfn=str(db_path),
-            force=True,
-            keep_order=True,
-            merge_strategy="merge",
-            sort_attribute_values=True,
-        )
+        create_kwargs = {
+            "data": str(gff3_path),
+            "dbfn": str(db_path),
+            "force": True,
+            "keep_order": True,
+            "merge_strategy": "merge",
+            "sort_attribute_values": True,
+        }
+        if gff3_path.suffix.lower() == ".gtf":
+            create_kwargs["disable_infer_genes"] = True
+            create_kwargs["disable_infer_transcripts"] = True
+
+        gffutils.create_db(**create_kwargs)
 
     db = gffutils.FeatureDB(str(db_path), keep_order=True)
 
     rows: list[dict[str, str | int]] = []
     for feature_name in feature_list:
         for record in db.features_of_type(feature_name):
-            attr_id = record.attributes.get("ID", [""])
-            attr_name = record.attributes.get("Name", [""])
-            attr_parent = record.attributes.get("Parent", [""])
+            attrs = {k: ",".join(v) for k, v in record.attributes.items()}
+            labels = _build_feature_labels(attrs)
             rows.append(
                 {
                     "Chromosome": str(record.seqid),
@@ -255,9 +277,9 @@ def extract_gff3_feature_intervals_gffutils(
                     "End": int(record.end),
                     "Feature": str(record.featuretype),
                     "Strand": str(record.strand),
-                    "ID": attr_id[0] if attr_id else "",
-                    "Name": attr_name[0] if attr_name else "",
-                    "Parent": attr_parent[0] if attr_parent else "",
+                    "ID": labels["ID"],
+                    "Name": labels["Name"],
+                    "Parent": labels["Parent"],
                     "Attributes": str(record.attributes),
                 }
             )
@@ -348,7 +370,7 @@ def extract_gff3_feature_interval_trees(
     feature: str | Iterable[str],
     ext_len: int = 500,
 ) -> dict[str, object]:
-    """Parse GFF3 text and return per-chromosome feature interval trees."""
+    """Parse GFF3 or GTF text and return per-chromosome feature interval trees."""
     interval_df = extract_gff3_feature_intervals(gff3_path=gff3_path, feature=feature)
     return build_feature_interval_trees(interval_df, ext_len=ext_len)
 
@@ -360,7 +382,7 @@ def extract_gff3_feature_interval_trees_gffutils(
     force_rebuild: bool = False,
     ext_len: int = 500,
 ) -> dict[str, object]:
-    """Parse GFF3 with gffutils and return per-chromosome feature interval trees."""
+    """Parse GFF3 or GTF with gffutils and return per-chromosome feature interval trees."""
     interval_df = extract_gff3_feature_intervals_gffutils(
         gff3_path=gff3_path,
         feature=feature,
