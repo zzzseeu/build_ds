@@ -8,6 +8,7 @@ columns must be standardized sample genotype columns.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 from dataclasses import dataclass
@@ -17,7 +18,6 @@ from typing import Dict, Iterable, List, Tuple
 import numpy as np
 import pandas as pd
 
-from embedding import UnifiedEmbedder
 from logging import init_logger
 from utils import standard_chrom, standard_sample_name
 
@@ -267,6 +267,8 @@ class VariantFeatureBuilder:
         self._embed_cache_misses = 0
 
         if self.embedder is None and self.embedder_type is not None:
+            from embedding import UnifiedEmbedder
+
             self.embedder = UnifiedEmbedder(
                 embedder_type=self.embedder_type,
                 model_name_or_path=self.model_name_or_path,
@@ -675,3 +677,88 @@ class VariantFeatureBuilder:
         }
         self.logger.info("VariantFeatureBuilder finished")
         return outputs
+
+
+def _parse_embedder_kwargs(raw: str | None) -> dict:
+    if raw is None:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("--embedder_kwargs must be a valid JSON object string") from exc
+    if not isinstance(value, dict):
+        raise ValueError("--embedder_kwargs must decode to a JSON object")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Build genotype matrices and downstream variant feature datasets")
+    subparsers = p.add_subparsers(dest="command", required=True)
+
+    p_genotype = subparsers.add_parser(
+        "genotype",
+        help="Extract sample genotype matrix (geno_df) from a selected site table and VCF",
+    )
+    p_genotype.add_argument("--vcf_path", required=True)
+    p_genotype.add_argument("--site_df_path", required=True)
+    p_genotype.add_argument("--outprefix", default=None)
+
+    p_build = subparsers.add_parser(
+        "build",
+        help="Build geno012_df, snp_extseq_df, and gene_seq_df from a geno_df CSV",
+    )
+    p_build.add_argument("--geno_df_path", required=True)
+    p_build.add_argument("--fasta_path", required=True)
+    p_build.add_argument("--vcf_path", required=True)
+    p_build.add_argument("--outdir", required=True)
+    p_build.add_argument("--embedder_type", required=True, choices=["generator", "evo2", "nt", "agront", "rice8k"])
+    p_build.add_argument("--model_name_or_path", required=True)
+    p_build.add_argument("--device", default="cpu")
+    p_build.add_argument("--pooling", default="mean")
+    p_build.add_argument("--local_files_only", action="store_true", default=True)
+    p_build.add_argument("--no-local_files_only", dest="local_files_only", action="store_false")
+    p_build.add_argument("--embedder_kwargs", default=None, help='JSON object string, e.g. \'{"torch_dtype":"bfloat16"}\'')
+    p_build.add_argument("--flank_k", type=int, default=50)
+    p_build.add_argument("--use_pca", action="store_true", default=True)
+    p_build.add_argument("--no-use_pca", dest="use_pca", action="store_false")
+    p_build.add_argument("--pca_var_threshold", type=float, default=0.95)
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+
+    if args.command == "genotype":
+        out_df = GWASQTLGenotypeExtractor(
+            vcf_path=args.vcf_path,
+            site_df_path=args.site_df_path,
+            outprefix=args.outprefix,
+        ).run()
+        print(out_df.shape)
+        return
+
+    if args.command == "build":
+        builder = VariantFeatureBuilder(
+            geno_df_path=args.geno_df_path,
+            fasta_path=args.fasta_path,
+            vcf_path=args.vcf_path,
+            outdir=args.outdir,
+            embedder_type=args.embedder_type,
+            model_name_or_path=args.model_name_or_path,
+            device=args.device,
+            pooling=args.pooling,
+            local_files_only=args.local_files_only,
+            embedder_kwargs=_parse_embedder_kwargs(args.embedder_kwargs),
+            flank_k=args.flank_k,
+            use_pca=args.use_pca,
+            pca_var_threshold=args.pca_var_threshold,
+        )
+        outputs = builder.run()
+        print({name: df.shape for name, df in outputs.items()})
+        return
+
+    raise ValueError(f"Unsupported command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()

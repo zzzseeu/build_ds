@@ -40,10 +40,11 @@
   - `GWASQTLGenotypeExtractor`
   - `VariantFeatureBuilder`
 - 使用方式：
-  - 当前模块没有 CLI 入口，推荐通过 Python API 调用；
+  - 当前模块同时提供 CLI 和 Python API；
+  - CLI 子命令：`genotype` 用于导出 `geno_df`，`build` 用于构建特征数据集；
   - `GWASQTLGenotypeExtractor.run()` 返回并可选保存 `geno_df`；
   - `VariantFeatureBuilder.run()` 会一次性构建并保存 3 个数据集；
-  - 若需要序列类特征，初始化 `VariantFeatureBuilder` 时必须提供 `embedder` 或 `embedder_type`。
+  - 若需要序列类特征，初始化 `VariantFeatureBuilder` 时必须提供 `embedder` 或 `embedder_type`；CLI 中使用 `--embedder_type + --model_name_or_path`。
 - 主要输出文件：
   - `{outprefix}.csv`：`GWASQTLGenotypeExtractor` 导出的 `geno_df`
   - `{outdir}/geno012_df.csv`
@@ -164,9 +165,44 @@ print(geno_df.head())
   - `qtl_trait`
 - 后续列全部为标准化样本名（如 `sample_1`）对应的 `0/1/2` 基因型
 
-## C. 构建特征数据集（Python API）
+## C. 提取 `geno_df`（CLI）
 
-`VariantFeatureBuilder` 没有命令行参数入口，直接通过类初始化传参并调用 `run()`：
+```bash
+conda run -n py-bioinfo python /path/to/project/variant_feature_builder.py genotype \
+  --vcf_path /path/to/project/test_inputs/variants.vcf \
+  --site_df_path /path/to/project/test_outputs/demo_sites_YYYY-MM-DD.csv \
+  --outprefix /path/to/project/test_outputs/demo_geno_df
+```
+
+输出示例文件：
+- `/path/to/project/test_outputs/demo_geno_df.csv`
+
+## D. 构建特征数据集（CLI）
+
+```bash
+conda run -n py-bioinfo python /path/to/project/variant_feature_builder.py build \
+  --geno_df_path /path/to/project/test_outputs/demo_geno_df.csv \
+  --fasta_path /path/to/project/test_inputs/genome.fa \
+  --vcf_path /path/to/project/test_inputs/variants.vcf \
+  --outdir /path/to/project/test_outputs/feature_demo_cli \
+  --embedder_type rice8k \
+  --model_name_or_path /path/to/models/rice_1B_stage2_8k_hf \
+  --device cuda \
+  --pooling mean \
+  --embedder_kwargs '{"torch_dtype":"bfloat16","use_flash_attention":true}' \
+  --flank_k 50 \
+  --use_pca \
+  --pca_var_threshold 0.95
+```
+
+说明：
+- `build` 子命令会一次性生成 `geno012_df.csv`、`snp_extseq_df.csv`、`gene_seq_df.csv`
+- `--embedder_kwargs` 需要传 JSON 对象字符串
+- 如模型已经在本地，保留默认 `--local_files_only` 即可；若允许远程拉取，可添加 `--no-local_files_only`
+
+## E. 构建特征数据集（Python API）
+
+也可以直接通过类初始化传参并调用 `run()`：
 
 ```python
 from variant_feature_builder import VariantFeatureBuilder
@@ -211,7 +247,7 @@ print(outputs["gene_seq_df"].shape)
   - `embedding_cache/` 下按序列 SHA1 命名的 `.npy` 缓存文件
 - 如果你已经有自定义 embedding 模型，也可以直接传入 `embedder=<callable>`，其输入应为单条 DNA 序列字符串，输出应为 1D 向量或形如 `(1, D)` 的数组
 
-## D. 两步流程示例
+## F. 两步流程示例
 
 ```python
 from gwas_qtl_variant_extractor import GWASQTLVariantExtractor
@@ -249,7 +285,7 @@ outputs = VariantFeatureBuilder(
 print(outputs["geno012_df"].head())
 ```
 
-## E. `utils.py` 使用示例
+## G. `utils.py` 使用示例
 
 ### 染色体标准化
 
