@@ -32,6 +32,162 @@ class VariantRecord:
     alt: str
 
 
+class GWASQTLGenotypeExtractor:
+    """Build a sample genotype matrix from GWAS/QTL selected variant sites.
+
+    The input site table is expected to have columns:
+    ``Chromosome, Position, Gene, gwas_trait, qtl_trait``.
+    Genotypes are encoded as:
+    - ``0``: reference / no variant
+    - ``1``: heterozygous variant
+    - ``2``: homozygous variant
+    """
+
+    SITE_COLUMNS = ["Chromosome", "Position", "Gene", "gwas_trait", "qtl_trait"]
+
+    def __init__(
+        self,
+        vcf_path: str,
+        site_df_path: str | None = None,
+        site_df: pd.DataFrame | None = None,
+        outprefix: str | None = None,
+    ) -> None:
+        if site_df_path is None and site_df is None:
+            raise ValueError("site_df_path or site_df must be provided")
+        self.site_df_path = Path(site_df_path) if site_df_path else None
+        self.site_df = site_df.copy() if site_df is not None else None
+        self.vcf_path = Path(vcf_path)
+        self.outprefix = Path(outprefix) if outprefix else None
+
+        site_parent = self.site_df_path.parent if self.site_df_path else Path.cwd()
+        log_dir = self.outprefix.parent if self.outprefix else site_parent
+        log_dir.mkdir(parents=True, exist_ok=True)
+        site_stem = self.site_df_path.stem if self.site_df_path else "site_df"
+        log_stem = self.outprefix.name if self.outprefix else site_stem
+        log_path = log_dir / f"{log_stem}_genotype_{Path.cwd().name}.log"
+        self.logger = init_logger("GWASQTLGenotypeExtractor", log_file=log_path)
+
+    @staticmethod
+    def _encode_gt(gt: Tuple[int | None, ...] | None) -> int:
+        """Encode VCF GT tuple into 0/1/2."""
+        if gt is None or any(x is None for x in gt):
+            return 0
+        alt_count = sum(1 for x in gt if x and x > 0)
+        if alt_count <= 0:
+            return 0
+        if alt_count == 1:
+            return 1
+        return 2
+
+    @staticmethod
+    def _standardize_sample_names(raw_samples: List[str]) -> Dict[str, str]:
+        """Standardize VCF sample names and keep them unique."""
+        sample_map: Dict[str, str] = {}
+        used: set[str] = set()
+        for idx, sample in enumerate(raw_samples):
+            std = standard_sample_name(sample) or f"sample_{idx + 1}"
+            if std in used:
+                std = f"{std}_{idx + 1}"
+            used.add(std)
+            sample_map[sample] = std
+        return sample_map
+
+    def _load_site_df(self) -> pd.DataFrame:
+        """Load and normalize site metadata dataframe."""
+        if self.site_df is not None:
+            df = self.site_df.copy()
+        else:
+            assert self.site_df_path is not None
+            df = pd.read_csv(self.site_df_path)
+        missing = [c for c in self.SITE_COLUMNS if c not in df.columns]
+        if missing:
+            raise ValueError(f"site_df missing columns: {missing}")
+
+        df = df.copy()
+        df["Chromosome"] = df["Chromosome"].astype(str).map(standard_chrom)
+        df = df[df["Chromosome"].notna()]
+        df["Position"] = df["Position"].astype(int)
+        df["Gene"] = df["Gene"].astype(str)
+        df["gwas_trait"] = df["gwas_trait"].fillna("").astype(str)
+        df["qtl_trait"] = df["qtl_trait"].fillna("").astype(str)
+        df = df.drop_duplicates().reset_index(drop=True)
+        self.logger.info(
+            "Loaded site_df: shape=%s unique_sites=%d",
+            df.shape,
+            df[["Chromosome", "Position"]].drop_duplicates().shape[0],
+        )
+        return df
+
+    def run(self) -> pd.DataFrame:
+        """Extract all-sample genotypes from VCF for the given site table."""
+        try:
+            import pysam  # type: ignore
+        except Exception as exc:
+            raise ImportError("pysam is required to read VCF") from exc
+
+        site_df = self._load_site_df()
+        target_sites = {
+            (str(chrom), int(pos))
+            for chrom, pos in site_df[["Chromosome", "Position"]].drop_duplicates().itertuples(index=False, name=None)
+        }
+
+        vcf = pysam.VariantFile(str(self.vcf_path))
+        raw_samples = list(vcf.header.samples)
+        sample_map = self._standardize_sample_names(raw_samples)
+        samples = [sample_map[sample] for sample in raw_samples]
+        self.logger.info("VCF loaded: samples=%d target_sites=%d", len(samples), len(target_sites))
+
+        genotype_map: Dict[Tuple[str, int], Dict[str, int]] = {}
+        seen = 0
+        matched = 0
+        for rec in vcf:
+            seen += 1
+            chrom = standard_chrom(str(rec.chrom))
+            if chrom is None:
+                continue
+            pos = int(rec.pos)
+            key = (chrom, pos)
+            if key not in target_sites:
+                continue
+
+            genotype_map[key] = {
+                sample_map[sample]: self._encode_gt(rec.samples[sample].get("GT"))
+                for sample in raw_samples
+            }
+            matched += 1
+            if matched % 1000 == 0 or matched == len(target_sites):
+                self.logger.info(
+                    "VCF genotype extraction progress: matched=%d/%d seen=%d",
+                    matched,
+                    len(target_sites),
+                    seen,
+                )
+
+        rows: List[Dict[str, str | int]] = []
+        for row in site_df.itertuples(index=False):
+            key = (str(row.Chromosome), int(row.Position))
+            sample_genotypes = genotype_map.get(key, {sample: 0 for sample in samples})
+            out_row: Dict[str, str | int] = {
+                "Chromosome": str(row.Chromosome),
+                "Position": int(row.Position),
+                "Gene": str(row.Gene),
+                "gwas_trait": str(row.gwas_trait),
+                "qtl_trait": str(row.qtl_trait),
+            }
+            out_row.update(sample_genotypes)
+            rows.append(out_row)
+
+        out_df = pd.DataFrame(rows, columns=self.SITE_COLUMNS + samples)
+        self.logger.info("Built genotype matrix: shape=%s", out_df.shape)
+
+        if self.outprefix is not None:
+            out_csv = self.outprefix.with_suffix(".csv")
+            out_df.to_csv(out_csv, index=False)
+            self.logger.info("Genotype matrix saved: %s", out_csv)
+
+        return out_df
+
+
 class VariantFeatureBuilder:
     """Build 012, SNP extended-sequence, and gene-sequence datasets.
 
