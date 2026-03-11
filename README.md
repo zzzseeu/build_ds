@@ -22,7 +22,7 @@
   - `--use_gffutils` 默认开启，使用 `gffutils` 解析 `gff3`
 - 输出文件：
   - `{outprefix}_{YYYY-MM-DD}.csv`
-  - 列为：`Chromosome, Position, Gene`
+  - 列为：`Chromosome, Position, Gene, gwas_trait, qtl_trait`
 - 输入文件格式：
   - GWAS CSV 必需列：`Chromosome, Position, Trait, pvalue`
   - QTL CSV 必需列：`QTL, Chromosome, LOD, PVE, start_pos, end_pos, Trait`
@@ -32,19 +32,17 @@
 
 ### 2) `variant_feature_builder.py`
 - 作用：
-  - 读取位点表 + VCF + FASTA；
-  - 构建多类型特征矩阵；
-  - 支持 embedding 缓存、PCA、数据集切分。
-- 核心输出：
-  - `genotype_012`
-  - `gene_sequence`
-  - `gene_pca`
-  - `concat_embedding`
-  - `extseq_raw`
-  - `extseq_pca`
-  - `distance_x_gt`
-  - `split_train/split_val/split_test`
-  - `meta.json`
+  - 提供 `GWASQTLGenotypeExtractor`，根据位点表 + VCF 提取所有样本的 `0/1/2` 基因型矩阵；
+  - 提供 `VariantFeatureBuilder`，根据 `geno_df + FASTA + VCF` 构建 3 类数据集；
+  - 支持 embedding 缓存、字典持久化、按位点或按基因 PCA 降维。
+- 主要类：
+  - `GWASQTLGenotypeExtractor`
+  - `VariantFeatureBuilder`
+- 当前核心输出：
+  - `geno_df`
+  - `geno012_df`
+  - `snp_extseq_df`
+  - `gene_seq_df`
 
 ### 3) `embedder.py`
 - 作用：具体模型加载实现（Rice8k/NT/Evo2 等）。
@@ -93,7 +91,7 @@ pip install pandas numpy pysam intervaltree scikit-learn transformers
 
 ### VCF
 - 坐标按 1-based。
-- `variant_feature_builder.py` 会读取样本基因型 `GT`，并转为 `0/1/2`。
+- `GWASQTLGenotypeExtractor` 会读取样本基因型 `GT`，并转为 `0/1/2`。
 
 ### FASTA
 - 染色体 ID 需与 VCF/位点文件可对应。
@@ -124,69 +122,77 @@ conda run -n py-bioinfo python /path/to/project/gwas_qtl_variant_extractor.py \
 - `/path/to/project/test_outputs/demo_sites_YYYY-MM-DD.csv`
 
 说明：
-- 输出结果是候选位点映射到基因区间后的结果，列为 `Chromosome, Position, Gene`
+- 输出结果是候选位点映射到基因区间后的结果，列为 `Chromosome, Position, Gene, gwas_trait, qtl_trait`
 - 若同一位点同时命中多个基因区间，则输出多行
 
-## B. 构建特征数据集（CLI）
+## B. 提取 `geno_df`（Python API）
 
-```bash
-conda run -n py-bioinfo python /path/to/project/variant_feature_builder.py \
-  --variant_df_path /path/to/project/test_outputs/demo_union.csv \
-  --vcf_path /path/to/project/test_inputs/variants.vcf \
-  --fasta_path /path/to/project/test_inputs/genome.fa \
-  --outdir /path/to/project/test_outputs/feature_demo \
-  --model_name_or_path /path/to/models/rice_1B_stage2_8k_hf \
-  --device cuda \
-  --torch_dtype bfloat16 \
-  --use_flash_attention \
-  --pooling mean \
-  --test_ratio 0.2 \
-  --val_ratio 0.1 \
-  --random_seed 42 \
-  --flank_k 20 \
-  --pca_var_threshold 0.95 \
-  --isolated_sample S001 S002 \
-  --file_format csv
+```python
+from variant_feature_builder import GWASQTLGenotypeExtractor
+
+geno_extractor = GWASQTLGenotypeExtractor(
+    vcf_path="/path/to/project/test_inputs/variants.vcf",
+    site_df_path="/path/to/project/test_outputs/demo_sites_YYYY-MM-DD.csv",
+    outprefix="/path/to/project/test_outputs/demo_geno_df",
+)
+
+geno_df = geno_extractor.run()
+print(geno_df.head())
 ```
 
+输出示例文件：
+- `/path/to/project/test_outputs/demo_geno_df.csv`
+
 说明：
-- 若 `--model_name_or_path` 不可用，可在 Python API 中传入自定义 mock embedder 进行流程验证。
+- `geno_df` 前 5 列固定为：
+  - `Chromosome`
+  - `Position`
+  - `Gene`
+  - `gwas_trait`
+  - `qtl_trait`
+- 后续列全部为标准化样本名（如 `sample_1`）对应的 `0/1/2` 基因型
 
 ## C. 构建特征数据集（Python API）
 
 ```python
-import torch
-from variant_feature_builder import VariantFeatureBuilder, UnifiedEmbedder
-
-embedder = UnifiedEmbedder(
-    "rice8k",
-    model_name_or_path="/path/to/models/rice_1B_stage2_8k_hf",
-    device="cuda",
-    torch_dtype=torch.bfloat16,
-    use_flash_attention=True,
-    pooling="mean",
-)
+from variant_feature_builder import VariantFeatureBuilder
 
 builder = VariantFeatureBuilder(
-    variant_df_path="/path/to/project/test_outputs/demo_union.csv",
+    geno_df_path="/path/to/project/test_outputs/demo_geno_df.csv",
     vcf_path="/path/to/project/test_inputs/variants.vcf",
     fasta_path="/path/to/project/test_inputs/genome.fa",
     outdir="/path/to/project/test_outputs/feature_demo_api",
-    embedder=embedder,
-    isolated_sample=["S001", "S002"],
-    test_ratio=0.2,
-    val_ratio=0.1,
-    random_seed=42,
-    flank_k=20,
+    embedder_type="rice8k",
+    model_name_or_path="/path/to/models/rice_1B_stage2_8k_hf",
+    device="cuda",
+    pooling="mean",
+    local_files_only=True,
+    embedder_kwargs={
+        "torch_dtype": "bfloat16",
+        "use_flash_attention": True,
+    },
+    flank_k=50,
+    use_pca=True,
     pca_var_threshold=0.95,
-    save_file=True,
-    file_format="csv",
 )
 
 outputs = builder.run()
-print(outputs["genotype_012"].shape)
-print(outputs["gene_pca"].shape)
+print(outputs["geno012_df"].shape)
+print(outputs["snp_extseq_df"].shape)
+print(outputs["gene_seq_df"].shape)
 ```
+
+说明：
+- `VariantFeatureBuilder` 当前构建 3 类数据集：
+  - `geno012_df`：行为样本，列为去重后的 `ChrN:Pos`
+  - `snp_extseq_df`：行为样本，列为位点扩展序列 embedding 或 PCA 特征
+  - `gene_seq_df`：行为样本，列为基因突变序列 embedding 或 PCA 特征
+- 会额外保存：
+  - 位点扩展序列字典
+  - 位点扩展序列 embedding 字典
+  - 基因突变序列字典
+  - 基因突变序列 embedding 字典
+  - 每个位点 / 每个基因的 PCA 模型文件（若 `use_pca=True`）
 
 ## D. `utils.py` 使用示例
 
