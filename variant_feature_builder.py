@@ -261,6 +261,10 @@ class VariantFeatureBuilder:
         self.geno_df: pd.DataFrame | None = None
         self.sample_columns: List[str] = []
         self.variant_map: Dict[Tuple[str, int], VariantRecord] = {}
+        self.embed_log_every = 500
+        self._embed_total = 0
+        self._embed_cache_hits = 0
+        self._embed_cache_misses = 0
 
         if self.embedder is None and self.embedder_type is not None:
             self.embedder = UnifiedEmbedder(
@@ -370,14 +374,31 @@ class VariantFeatureBuilder:
         return arr.astype(np.float32)
 
     def _embed_sequence(self, seq: str) -> np.ndarray:
-        """Embed one DNA sequence with on-disk caching."""
+        """Embed one DNA sequence with ``.npy`` caching.
+
+        Identical sequences share the same SHA1-based cache file, so repeated
+        sequences are not embedded more than once.
+        """
         self._ensure_embedder()
+        self._embed_total += 1
         seq_hash = hashlib.sha1(seq.encode("utf-8")).hexdigest()
         cache_path = self.cache_dir / f"{seq_hash}.npy"
         if cache_path.exists():
-            return np.load(cache_path)
-        vec = self._to_numpy_1d(self.embedder(seq))
-        np.save(cache_path, vec)
+            self._embed_cache_hits += 1
+            vec = np.load(cache_path)
+        else:
+            self._embed_cache_misses += 1
+            vec = self._to_numpy_1d(self.embedder(seq))
+            np.save(cache_path, vec)
+
+        if self._embed_total % self.embed_log_every == 0:
+            self.logger.info(
+                "Embedding progress: total=%d cache_hits=%d cache_misses=%d",
+                self._embed_total,
+                self._embed_cache_hits,
+                self._embed_cache_misses,
+            )
+
         return vec
 
     @staticmethod
@@ -496,11 +517,18 @@ class VariantFeatureBuilder:
         """Build sample-by-site extended-sequence embedding features."""
         assert self.geno_df is not None
         extseq_dict = self._build_extseq_dict()
+        self.logger.info("Embedding SNP extended sequences: sites=%d", len(extseq_dict))
         embed_dict: Dict[str, np.ndarray] = {}
         for site_key, seq_dict in extseq_dict.items():
             embed_dict[f"{site_key}|ref"] = self._embed_sequence(seq_dict["ref_seq"])
             embed_dict[f"{site_key}|alt"] = self._embed_sequence(seq_dict["alt_seq"])
         self._save_npz_dict(embed_dict, self.dict_dir / "site_extseq_embedding.npz")
+        self.logger.info(
+            "Finished SNP extended-sequence embedding: total=%d cache_hits=%d cache_misses=%d",
+            self._embed_total,
+            self._embed_cache_hits,
+            self._embed_cache_misses,
+        )
 
         site_df = (
             self.geno_df.sort_values(["Chromosome", "Position"])
@@ -605,6 +633,7 @@ class VariantFeatureBuilder:
         """Build sample-by-gene mutated sequence embedding features."""
         gene_seq_dict = self._build_gene_seq_dict()
         genes = sorted({gene for sample_data in gene_seq_dict.values() for gene in sample_data})
+        self.logger.info("Embedding gene sequences: genes=%d samples=%d", len(genes), len(self.sample_columns))
         embed_dict: Dict[str, np.ndarray] = {}
         blocks = []
         columns = ["sample"]
@@ -622,6 +651,12 @@ class VariantFeatureBuilder:
             columns.extend(cols)
 
         self._save_npz_dict(embed_dict, self.dict_dir / "gene_seq_embedding.npz")
+        self.logger.info(
+            "Finished gene-sequence embedding: total=%d cache_hits=%d cache_misses=%d",
+            self._embed_total,
+            self._embed_cache_hits,
+            self._embed_cache_misses,
+        )
         matrix = np.concatenate(blocks, axis=1) if blocks else np.empty((len(self.sample_columns), 0), dtype=np.float32)
         out_df = pd.DataFrame(matrix, columns=columns[1:])
         out_df.insert(0, "sample", self.sample_columns)

@@ -11,6 +11,7 @@
   - 在 VCF 位点上计算 GWAS 与 QTL 的 `intersect/union`；
   - 将候选位点固定映射到 `gff3` 给定 feature 区间上；
   - 支持按 `Trait`、`Gene` 与阈值过滤（`pvalue/LOD/PVE`）；
+  - 输出候选位点信息表，不直接输出样本基因型矩阵；
   - 坐标统一按 1-based 输出。
 - 输入参数（CLI）：
   - 必需：`--gwas_csv_path --qtl_csv_path --type --vcf_path --gff3_path --outprefix`
@@ -32,17 +33,28 @@
 
 ### 2) `variant_feature_builder.py`
 - 作用：
-  - 提供 `GWASQTLGenotypeExtractor`，根据位点表 + VCF 提取所有样本的 `0/1/2` 基因型矩阵；
-  - 提供 `VariantFeatureBuilder`，根据 `geno_df + FASTA + VCF` 构建 3 类数据集；
-  - 支持 embedding 缓存、字典持久化、按位点或按基因 PCA 降维。
+  - 提供 `GWASQTLGenotypeExtractor`，根据位点表 + VCF 提取所有样本的 `0/1/2` 基因型矩阵 `geno_df`；
+  - 提供 `VariantFeatureBuilder`，根据 `geno_df + FASTA + VCF` 构建 `geno012_df / snp_extseq_df / gene_seq_df`；
+  - 支持 embedding 缓存、序列/embedding 字典持久化、按位点或按基因 PCA 降维。
 - 主要类：
   - `GWASQTLGenotypeExtractor`
   - `VariantFeatureBuilder`
-- 当前核心输出：
-  - `geno_df`
-  - `geno012_df`
-  - `snp_extseq_df`
-  - `gene_seq_df`
+- 使用方式：
+  - 当前模块没有 CLI 入口，推荐通过 Python API 调用；
+  - `GWASQTLGenotypeExtractor.run()` 返回并可选保存 `geno_df`；
+  - `VariantFeatureBuilder.run()` 会一次性构建并保存 3 个数据集；
+  - 若需要序列类特征，初始化 `VariantFeatureBuilder` 时必须提供 `embedder` 或 `embedder_type`。
+- 主要输出文件：
+  - `{outprefix}.csv`：`GWASQTLGenotypeExtractor` 导出的 `geno_df`
+  - `{outdir}/geno012_df.csv`
+  - `{outdir}/snp_extseq_df.csv`
+  - `{outdir}/gene_seq_df.csv`
+  - `{outdir}/dicts/site_extseq_dict.json`
+  - `{outdir}/dicts/site_extseq_embedding.npz`
+  - `{outdir}/dicts/gene_seq_dict.json`
+  - `{outdir}/dicts/gene_seq_embedding.npz`
+  - `{outdir}/pca_models/`（当 `use_pca=True`）
+  - `{outdir}/embedding_cache/`
 
 ### 3) `embedder.py`
 - 作用：具体模型加载实现（Rice8k/NT/Evo2 等）。
@@ -154,6 +166,8 @@ print(geno_df.head())
 
 ## C. 构建特征数据集（Python API）
 
+`VariantFeatureBuilder` 没有命令行参数入口，直接通过类初始化传参并调用 `run()`：
+
 ```python
 from variant_feature_builder import VariantFeatureBuilder
 
@@ -187,14 +201,55 @@ print(outputs["gene_seq_df"].shape)
   - `geno012_df`：行为样本，列为去重后的 `ChrN:Pos`
   - `snp_extseq_df`：行为样本，列为位点扩展序列 embedding 或 PCA 特征
   - `gene_seq_df`：行为样本，列为基因突变序列 embedding 或 PCA 特征
+- `run()` 返回一个字典，键固定为：`geno012_df`、`snp_extseq_df`、`gene_seq_df`
 - 会额外保存：
-  - 位点扩展序列字典
-  - 位点扩展序列 embedding 字典
-  - 基因突变序列字典
-  - 基因突变序列 embedding 字典
-  - 每个位点 / 每个基因的 PCA 模型文件（若 `use_pca=True`）
+  - `dicts/site_extseq_dict.json`
+  - `dicts/site_extseq_embedding.npz`
+  - `dicts/gene_seq_dict.json`
+  - `dicts/gene_seq_embedding.npz`
+  - `pca_models/` 下的每个位点 / 每个基因 PCA 模型文件（若 `use_pca=True`）
+  - `embedding_cache/` 下按序列 SHA1 命名的 `.npy` 缓存文件
+- 如果你已经有自定义 embedding 模型，也可以直接传入 `embedder=<callable>`，其输入应为单条 DNA 序列字符串，输出应为 1D 向量或形如 `(1, D)` 的数组
 
-## D. `utils.py` 使用示例
+## D. 两步流程示例
+
+```python
+from gwas_qtl_variant_extractor import GWASQTLVariantExtractor
+from variant_feature_builder import GWASQTLGenotypeExtractor, VariantFeatureBuilder
+
+# 第一步：提取候选位点信息
+site_df = GWASQTLVariantExtractor(
+    gwas_csv_path="/path/to/project/test_inputs/gwas.csv",
+    qtl_csv_path="/path/to/project/test_inputs/qtl.csv",
+    type="union",
+    vcf_path="/path/to/project/test_inputs/variants.vcf",
+    gff3_path="/path/to/project/test_inputs/annotation.gff3",
+    outprefix="/path/to/project/test_outputs/demo_sites",
+    trait="Yield",
+    use_gffutils=True,
+).run()
+
+# 第二步：从位点信息提取 geno_df
+geno_df = GWASQTLGenotypeExtractor(
+    vcf_path="/path/to/project/test_inputs/variants.vcf",
+    site_df=site_df,
+    outprefix="/path/to/project/test_outputs/demo_geno_df",
+).run()
+
+# 第三步：基于 geno_df 构建特征数据集
+outputs = VariantFeatureBuilder(
+    geno_df_path="/path/to/project/test_outputs/demo_geno_df.csv",
+    fasta_path="/path/to/project/test_inputs/genome.fa",
+    vcf_path="/path/to/project/test_inputs/variants.vcf",
+    outdir="/path/to/project/test_outputs/feature_demo",
+    embedder_type="rice8k",
+    model_name_or_path="/path/to/models/rice_1B_stage2_8k_hf",
+).run()
+
+print(outputs["geno012_df"].head())
+```
+
+## E. `utils.py` 使用示例
 
 ### 染色体标准化
 
@@ -254,13 +309,16 @@ print(hits)
 
 ## 输出列命名约定
 
-位点相关特征列使用统一命名：
+`variant_feature_builder.py` 的输出列命名约定如下：
 
-`Chr:Position:Ref>Alt-gene_id`
+- `geno012_df`：`sample` + `ChrN:Pos`
+- `snp_extseq_df`：`sample` + `ChrN:Pos_embed_i` 或 `ChrN:Pos_PCn`
+- `gene_seq_df`：`sample` + `Gene_embed_i` 或 `Gene_PCn`
 
 示例：
-- `Chr1:100:A>G-GeneX`
-- `Chr2:350:C>T-GeneY_PC1`（PCA 列会追加 `_PCn`）
+- `Chr1:100`
+- `Chr1:100_PC1`
+- `LOC_Os01g01010_PC2`
 
 ## 常见问题
 
