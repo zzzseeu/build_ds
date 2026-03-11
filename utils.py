@@ -42,6 +42,24 @@ def standard_chrom(chrom: str) -> str | None:
     return f"Chr{int(match.group(1))}"
 
 
+def standard_sample_name(sample: str) -> str | None:
+    """Normalize sample names to ``sample_N`` using the first numeric token.
+
+    Examples
+    --------
+    ``1`` -> ``sample_1``
+    ``sample1`` -> ``sample_1``
+    ``Sample_01`` -> ``sample_1``
+    """
+    s = str(sample).strip()
+    if not s:
+        return None
+    match = re.search(r"(\d+)", s)
+    if match is None:
+        return None
+    return f"sample_{int(match.group(1))}"
+
+
 def parse_gff3_attributes(attr_text: str) -> dict[str, str]:
     """Parse the GFF3 or GTF attribute column into a dictionary.
 
