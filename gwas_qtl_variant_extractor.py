@@ -143,7 +143,10 @@ class GWASQTLVariantExtractor:
         df = df.copy()
         df["Chromosome"] = df["Chromosome"].astype(str).map(standard_chrom)
         df = df[df["Chromosome"].notna()]
+        df["Position"] = pd.to_numeric(df["Position"], errors="coerce").astype("Int64")
+        df = df[df["Position"].notna()]
         df["Position"] = df["Position"].astype(int)
+        df = df[df["Position"] >= 1]
         df["Trait"] = df["Trait"].astype(str)
         df["pvalue"] = pd.to_numeric(df["pvalue"], errors="coerce")
         df = df[df["pvalue"] < self.pvalue_threshold]
@@ -171,6 +174,10 @@ class GWASQTLVariantExtractor:
 
         df = df[(df["LOD"] > self.lod_threshold) & (df["PVE"] > self.pve_threshold)]
         df = df[df["start_pos"].notna() & df["end_pos"].notna()]
+        df = df[(df["start_pos"] >= 1) & (df["end_pos"] >= 1)]
+        swapped = df["start_pos"] > df["end_pos"]
+        if swapped.any():
+            df.loc[swapped, ["start_pos", "end_pos"]] = df.loc[swapped, ["end_pos", "start_pos"]].to_numpy()
         if self.trait_set is not None:
             df = df[df["Trait"].isin(self.trait_set)]
 
@@ -333,6 +340,7 @@ class GWASQTLVariantExtractor:
             rows,
             columns=["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait"],
         )
+        out_df = out_df[(out_df["Position"] >= out_df["gene_start"]) & (out_df["Position"] <= out_df["gene_end"])]
         out_df = out_df.drop_duplicates().sort_values(
             ["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait"]
         ).reset_index(drop=True)

@@ -106,10 +106,20 @@ class GWASQTLGenotypeExtractor:
         df = df.copy()
         df["Chromosome"] = df["Chromosome"].astype(str).map(standard_chrom)
         df = df[df["Chromosome"].notna()]
+        df["Position"] = pd.to_numeric(df["Position"], errors="coerce").astype("Int64")
+        df = df[df["Position"].notna()]
         df["Position"] = df["Position"].astype(int)
         df["Gene"] = df["Gene"].astype(str)
-        df["gene_start"] = pd.to_numeric(df["gene_start"], errors="coerce").astype(int)
-        df["gene_end"] = pd.to_numeric(df["gene_end"], errors="coerce").astype(int)
+        df["gene_start"] = pd.to_numeric(df["gene_start"], errors="coerce").astype("Int64")
+        df["gene_end"] = pd.to_numeric(df["gene_end"], errors="coerce").astype("Int64")
+        df = df[df["gene_start"].notna() & df["gene_end"].notna()]
+        df["gene_start"] = df["gene_start"].astype(int)
+        df["gene_end"] = df["gene_end"].astype(int)
+        df = df[(df["Position"] >= 1) & (df["gene_start"] >= 1) & (df["gene_end"] >= 1)]
+        swapped = df["gene_start"] > df["gene_end"]
+        if swapped.any():
+            df.loc[swapped, ["gene_start", "gene_end"]] = df.loc[swapped, ["gene_end", "gene_start"]].to_numpy()
+        df = df[(df["Position"] >= df["gene_start"]) & (df["Position"] <= df["gene_end"])]
         df["gwas_trait"] = df["gwas_trait"].fillna("").astype(str)
         df["qtl_trait"] = df["qtl_trait"].fillna("").astype(str)
         df = df.drop_duplicates().reset_index(drop=True)
@@ -293,10 +303,20 @@ class VariantFeatureBuilder:
         df = df.copy()
         df["Chromosome"] = df["Chromosome"].astype(str).map(standard_chrom)
         df = df[df["Chromosome"].notna()]
+        df["Position"] = pd.to_numeric(df["Position"], errors="coerce").astype("Int64")
+        df = df[df["Position"].notna()]
         df["Position"] = df["Position"].astype(int)
         df["Gene"] = df["Gene"].astype(str)
-        df["gene_start"] = pd.to_numeric(df["gene_start"], errors="coerce").astype(int)
-        df["gene_end"] = pd.to_numeric(df["gene_end"], errors="coerce").astype(int)
+        df["gene_start"] = pd.to_numeric(df["gene_start"], errors="coerce").astype("Int64")
+        df["gene_end"] = pd.to_numeric(df["gene_end"], errors="coerce").astype("Int64")
+        df = df[df["gene_start"].notna() & df["gene_end"].notna()]
+        df["gene_start"] = df["gene_start"].astype(int)
+        df["gene_end"] = df["gene_end"].astype(int)
+        df = df[(df["Position"] >= 1) & (df["gene_start"] >= 1) & (df["gene_end"] >= 1)]
+        swapped = df["gene_start"] > df["gene_end"]
+        if swapped.any():
+            df.loc[swapped, ["gene_start", "gene_end"]] = df.loc[swapped, ["gene_end", "gene_start"]].to_numpy()
+        df = df[(df["Position"] >= df["gene_start"]) & (df["Position"] <= df["gene_end"])]
         df["gwas_trait"] = df["gwas_trait"].fillna("").astype(str)
         df["qtl_trait"] = df["qtl_trait"].fillna("").astype(str)
         df["REF"] = df["REF"].fillna("").astype(str)
@@ -349,6 +369,40 @@ class VariantFeatureBuilder:
 
         self.logger.info("Loaded variant_map from geno_df: sites=%d", len(variant_map))
         return variant_map
+
+    def _validate_ref_alleles_against_fasta(self) -> None:
+        """Validate that REF alleles match the 1-based reference genome coordinates."""
+        assert self.geno_df is not None
+        fa = self._get_fasta()
+        fasta_chrom_map = self._build_fasta_chrom_map(fa)
+        checked = 0
+        mismatched = 0
+
+        uniq_df = (
+            self.geno_df[["Chromosome", "Position", "REF"]]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+        for row in uniq_df.itertuples(index=False):
+            ref = str(row.REF)
+            if not ref:
+                continue
+            chrom = str(row.Chromosome)
+            pos = int(row.Position)
+            fasta_chrom = self._resolve_fasta_chrom(chrom, fasta_chrom_map)
+            ref_from_fasta = fa.fetch(fasta_chrom, pos - 1, pos - 1 + len(ref))
+            checked += 1
+            if ref_from_fasta.upper() != ref.upper():
+                mismatched += 1
+                self.logger.warning(
+                    "1-based REF mismatch at %s:%d expected=%s observed=%s",
+                    chrom,
+                    pos,
+                    ref,
+                    ref_from_fasta,
+                )
+
+        self.logger.info("REF allele validation finished: checked=%d mismatched=%d", checked, mismatched)
 
     def _feature_name(self, chrom: str, pos: int) -> str:
         return f"{chrom}:{int(pos)}"
@@ -626,6 +680,7 @@ class VariantFeatureBuilder:
         """Build all configured datasets and return them as dataframes."""
         self.geno_df = self._load_geno_df()
         self.variant_map = self._load_variant_map()
+        self._validate_ref_alleles_against_fasta()
         outputs = {
             "geno012_df": self.build_geno012_df(),
             "gene_seq_df": self.build_gene_seq_df(),
