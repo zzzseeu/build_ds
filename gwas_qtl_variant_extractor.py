@@ -307,7 +307,7 @@ class GWASQTLVariantExtractor:
         if feature_trees is None:
             return site_df
 
-        rows: list[tuple[str, int, str, str, str]] = []
+        rows: list[tuple[str, int, str, int, int, str, str]] = []
         for row in site_df.itertuples(index=False):
             hits = query_feature_interval_trees(
                 interval_trees=feature_trees,
@@ -322,14 +322,19 @@ class GWASQTLVariantExtractor:
                         str(row.Chromosome),
                         int(row.Position),
                         self._feature_label(hit),
+                        int(hit.get("start", 0)),
+                        int(hit.get("end", 0)),
                         str(row.gwas_trait),
                         str(row.qtl_trait),
                     )
                 )
 
-        out_df = pd.DataFrame(rows, columns=["Chromosome", "Position", "Gene", "gwas_trait", "qtl_trait"])
+        out_df = pd.DataFrame(
+            rows,
+            columns=["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait"],
+        )
         out_df = out_df.drop_duplicates().sort_values(
-            ["Chromosome", "Position", "Gene", "gwas_trait", "qtl_trait"]
+            ["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait"]
         ).reset_index(drop=True)
         self.logger.info("Feature-filtered output built: rows=%d", len(out_df))
         return out_df

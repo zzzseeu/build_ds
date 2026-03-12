@@ -34,8 +34,8 @@
 ### 2) `variant_feature_builder.py`
 - 作用：
   - 提供 `GWASQTLGenotypeExtractor`，根据位点表 + VCF 提取所有样本的 `0/1/2` 基因型矩阵 `geno_df`；
-  - 提供 `VariantFeatureBuilder`，根据 `geno_df + FASTA + VCF` 构建 `geno012_df / snp_extseq_df / gene_seq_df`；
-  - 支持 embedding 缓存、序列/embedding 字典持久化、按位点或按基因 PCA 降维。
+  - 提供 `VariantFeatureBuilder`，根据 `geno_df + FASTA` 构建 `geno012_df / gene_seq_df`；
+  - 支持 embedding 缓存、序列/embedding 字典持久化、按基因 PCA 降维。
 - 主要类：
   - `GWASQTLGenotypeExtractor`
   - `VariantFeatureBuilder`
@@ -48,12 +48,11 @@
 - 主要输出文件：
   - `{outprefix}.csv`：`GWASQTLGenotypeExtractor` 导出的 `geno_df`
   - `{outdir}/geno012_df.csv`
-  - `{outdir}/snp_extseq_df.csv`
   - `{outdir}/gene_seq_df.csv`
-  - `{outdir}/dicts/site_extseq_dict.json`
-  - `{outdir}/dicts/site_extseq_embedding.npz`
-  - `{outdir}/dicts/gene_seq_dict.json`
-  - `{outdir}/dicts/gene_seq_embedding.npz`
+  - `{outdir}/dicts/ref_gene_seq_dict.json`
+  - `{outdir}/dicts/alt_gene_seq_dict.json`
+  - `{outdir}/dicts/alt_gene_seq_embedding_dict.json`
+  - `{outdir}/dicts/alt_gene_seq_embedding_pca_dict.json`
   - `{outdir}/pca_models/`（当 `use_pca=True`）
   - `{outdir}/embedding_cache/`
 
@@ -183,20 +182,18 @@ conda run -n py-bioinfo python /path/to/project/variant_feature_builder.py genot
 conda run -n py-bioinfo python /path/to/project/variant_feature_builder.py build \
   --geno_df_path /path/to/project/test_outputs/demo_geno_df.csv \
   --fasta_path /path/to/project/test_inputs/genome.fa \
-  --vcf_path /path/to/project/test_inputs/variants.vcf \
   --outdir /path/to/project/test_outputs/feature_demo_cli \
   --embedder_type rice8k \
   --model_name_or_path /path/to/models/rice_1B_stage2_8k_hf \
   --device cuda \
   --pooling mean \
   --embedder_kwargs '{"torch_dtype":"bfloat16","use_flash_attention":true}' \
-  --flank_k 50 \
   --use_pca \
   --pca_var_threshold 0.95
 ```
 
 说明：
-- `build` 子命令会一次性生成 `geno012_df.csv`、`snp_extseq_df.csv`、`gene_seq_df.csv`
+- `build` 子命令会一次性生成 `geno012_df.csv`、`gene_seq_df.csv`
 - `--embedder_kwargs` 需要传 JSON 对象字符串
 - 如模型已经在本地，保留默认 `--local_files_only` 即可；若允许远程拉取，可添加 `--no-local_files_only`
 
@@ -209,7 +206,6 @@ from variant_feature_builder import VariantFeatureBuilder
 
 builder = VariantFeatureBuilder(
     geno_df_path="/path/to/project/test_outputs/demo_geno_df.csv",
-    vcf_path="/path/to/project/test_inputs/variants.vcf",
     fasta_path="/path/to/project/test_inputs/genome.fa",
     outdir="/path/to/project/test_outputs/feature_demo_api",
     embedder_type="rice8k",
@@ -221,29 +217,26 @@ builder = VariantFeatureBuilder(
         "torch_dtype": "bfloat16",
         "use_flash_attention": True,
     },
-    flank_k=50,
     use_pca=True,
     pca_var_threshold=0.95,
 )
 
 outputs = builder.run()
 print(outputs["geno012_df"].shape)
-print(outputs["snp_extseq_df"].shape)
 print(outputs["gene_seq_df"].shape)
 ```
 
 说明：
-- `VariantFeatureBuilder` 当前构建 3 类数据集：
+- `VariantFeatureBuilder` 当前构建 2 类数据集：
   - `geno012_df`：行为样本，列为去重后的 `ChrN:Pos`
-  - `snp_extseq_df`：行为样本，列为位点扩展序列 embedding 或 PCA 特征
   - `gene_seq_df`：行为样本，列为基因突变序列 embedding 或 PCA 特征
-- `run()` 返回一个字典，键固定为：`geno012_df`、`snp_extseq_df`、`gene_seq_df`
+- `run()` 返回一个字典，键固定为：`geno012_df`、`gene_seq_df`
 - 会额外保存：
-  - `dicts/site_extseq_dict.json`
-  - `dicts/site_extseq_embedding.npz`
-  - `dicts/gene_seq_dict.json`
-  - `dicts/gene_seq_embedding.npz`
-  - `pca_models/` 下的每个位点 / 每个基因 PCA 模型文件（若 `use_pca=True`）
+  - `dicts/ref_gene_seq_dict.json`
+  - `dicts/alt_gene_seq_dict.json`
+  - `dicts/alt_gene_seq_embedding_dict.json`
+  - `dicts/alt_gene_seq_embedding_pca_dict.json`
+  - `pca_models/` 下的每个基因 PCA 模型文件（若 `use_pca=True`）
   - `embedding_cache/` 下按序列 SHA1 命名的 `.npy` 缓存文件
 - 如果你已经有自定义 embedding 模型，也可以直接传入 `embedder=<callable>`，其输入应为单条 DNA 序列字符串，输出应为 1D 向量或形如 `(1, D)` 的数组
 
@@ -276,7 +269,6 @@ geno_df = GWASQTLGenotypeExtractor(
 outputs = VariantFeatureBuilder(
     geno_df_path="/path/to/project/test_outputs/demo_geno_df.csv",
     fasta_path="/path/to/project/test_inputs/genome.fa",
-    vcf_path="/path/to/project/test_inputs/variants.vcf",
     outdir="/path/to/project/test_outputs/feature_demo",
     embedder_type="rice8k",
     model_name_or_path="/path/to/models/rice_1B_stage2_8k_hf",
@@ -348,7 +340,6 @@ print(hits)
 `variant_feature_builder.py` 的输出列命名约定如下：
 
 - `geno012_df`：`sample` + `ChrN:Pos`
-- `snp_extseq_df`：`sample` + `ChrN:Pos_embed_i` 或 `ChrN:Pos_PCn`
 - `gene_seq_df`：`sample` + `Gene_embed_i` 或 `Gene_PCn`
 
 示例：

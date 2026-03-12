@@ -1,9 +1,9 @@
 """Build downstream datasets from a genotype matrix exported by GWAS/QTL extraction.
 
 This module expects a ``geno_df`` CSV produced by
-``GWASQTLGenotypeExtractor``. The first five columns must be:
-``Chromosome, Position, Gene, gwas_trait, qtl_trait`` and the remaining
-columns must be standardized sample genotype columns.
+``GWASQTLGenotypeExtractor``. The metadata columns must include genomic
+location, gene interval, trait labels, and ``REF/ALT`` alleles; the
+remaining columns must be standardized sample genotype columns.
 """
 
 from __future__ import annotations
@@ -36,14 +36,14 @@ class GWASQTLGenotypeExtractor:
     """Build a sample genotype matrix from GWAS/QTL selected variant sites.
 
     The input site table is expected to have columns:
-    ``Chromosome, Position, Gene, gwas_trait, qtl_trait``.
+    ``Chromosome, Position, Gene, gene_start, gene_end, gwas_trait, qtl_trait``.
     Genotypes are encoded as:
     - ``0``: reference / no variant
     - ``1``: heterozygous variant
     - ``2``: homozygous variant
     """
 
-    SITE_COLUMNS = ["Chromosome", "Position", "Gene", "gwas_trait", "qtl_trait"]
+    SITE_COLUMNS = ["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait"]
 
     def __init__(
         self,
@@ -108,6 +108,8 @@ class GWASQTLGenotypeExtractor:
         df = df[df["Chromosome"].notna()]
         df["Position"] = df["Position"].astype(int)
         df["Gene"] = df["Gene"].astype(str)
+        df["gene_start"] = pd.to_numeric(df["gene_start"], errors="coerce").astype(int)
+        df["gene_end"] = pd.to_numeric(df["gene_end"], errors="coerce").astype(int)
         df["gwas_trait"] = df["gwas_trait"].fillna("").astype(str)
         df["qtl_trait"] = df["qtl_trait"].fillna("").astype(str)
         df = df.drop_duplicates().reset_index(drop=True)
@@ -137,7 +139,7 @@ class GWASQTLGenotypeExtractor:
         samples = [sample_map[sample] for sample in raw_samples]
         self.logger.info("VCF loaded: samples=%d target_sites=%d", len(samples), len(target_sites))
 
-        genotype_map: Dict[Tuple[str, int], Dict[str, int]] = {}
+        genotype_map: Dict[Tuple[str, int], Dict[str, str | int]] = {}
         seen = 0
         matched = 0
         for rec in vcf:
@@ -150,10 +152,15 @@ class GWASQTLGenotypeExtractor:
             if key not in target_sites:
                 continue
 
-            genotype_map[key] = {
+            row_map: Dict[str, str | int] = {
+                "REF": str(rec.ref),
+                "ALT": str(rec.alts[0]) if rec.alts else "",
+            }
+            row_map.update({
                 sample_map[sample]: self._encode_gt(rec.samples[sample].get("GT"))
                 for sample in raw_samples
-            }
+            })
+            genotype_map[key] = row_map
             matched += 1
             if matched % 1000 == 0 or matched == len(target_sites):
                 self.logger.info(
@@ -166,18 +173,24 @@ class GWASQTLGenotypeExtractor:
         rows: List[Dict[str, str | int]] = []
         for row in site_df.itertuples(index=False):
             key = (str(row.Chromosome), int(row.Position))
-            sample_genotypes = genotype_map.get(key, {sample: 0 for sample in samples})
+            default_row: Dict[str, str | int] = {"REF": "", "ALT": ""}
+            default_row.update({sample: 0 for sample in samples})
+            sample_genotypes = genotype_map.get(key, default_row)
             out_row: Dict[str, str | int] = {
                 "Chromosome": str(row.Chromosome),
                 "Position": int(row.Position),
                 "Gene": str(row.Gene),
+                "gene_start": int(row.gene_start),
+                "gene_end": int(row.gene_end),
                 "gwas_trait": str(row.gwas_trait),
                 "qtl_trait": str(row.qtl_trait),
+                "REF": str(sample_genotypes.get("REF", "")),
+                "ALT": str(sample_genotypes.get("ALT", "")),
             }
-            out_row.update(sample_genotypes)
+            out_row.update({sample: int(sample_genotypes.get(sample, 0)) for sample in samples})
             rows.append(out_row)
 
-        out_df = pd.DataFrame(rows, columns=self.SITE_COLUMNS + samples)
+        out_df = pd.DataFrame(rows, columns=self.SITE_COLUMNS + ["REF", "ALT"] + samples)
         self.logger.info("Built genotype matrix: shape=%s", out_df.shape)
 
         if self.outprefix is not None:
@@ -189,7 +202,7 @@ class GWASQTLGenotypeExtractor:
 
 
 class VariantFeatureBuilder:
-    """Build 012, SNP extended-sequence, and gene-sequence datasets.
+    """Build 012 and gene-sequence datasets.
 
     Parameters
     ----------
@@ -197,15 +210,11 @@ class VariantFeatureBuilder:
         Path to the genotype matrix CSV from ``GWASQTLGenotypeExtractor``.
     fasta_path : str
         Reference FASTA path.
-    vcf_path : str
-        VCF path used to recover reference and alternative alleles.
     outdir : str
         Output directory for dataframes, dictionaries, embeddings, and PCA models.
     embedder : object | None
         Callable embedder. It should accept a single DNA sequence string and
         return a 1D vector or a 2D array with batch dimension 1.
-    flank_k : int
-        Upstream/downstream extension length for SNP extended-sequence features.
     use_pca : bool
         Whether to fit PCA per site / per gene embedding block.
     pca_var_threshold : float
@@ -213,13 +222,12 @@ class VariantFeatureBuilder:
         component count.
     """
 
-    META_COLUMNS = ["Chromosome", "Position", "Gene", "gwas_trait", "qtl_trait"]
+    META_COLUMNS = ["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait", "REF", "ALT"]
 
     def __init__(
         self,
         geno_df_path: str,
         fasta_path: str,
-        vcf_path: str,
         outdir: str,
         embedder=None,
         embedder_type: str | None = None,
@@ -228,13 +236,11 @@ class VariantFeatureBuilder:
         pooling: str = "mean",
         local_files_only: bool = True,
         embedder_kwargs: dict | None = None,
-        flank_k: int = 50,
         use_pca: bool = True,
         pca_var_threshold: float = 0.95,
     ) -> None:
         self.geno_df_path = Path(geno_df_path)
         self.fasta_path = Path(fasta_path)
-        self.vcf_path = Path(vcf_path)
         self.outdir = Path(outdir)
         self.embedder = embedder
         self.embedder_type = embedder_type
@@ -243,7 +249,6 @@ class VariantFeatureBuilder:
         self.pooling = pooling
         self.local_files_only = bool(local_files_only)
         self.embedder_kwargs = dict(embedder_kwargs or {})
-        self.flank_k = int(flank_k)
         self.use_pca = bool(use_pca)
         self.pca_var_threshold = float(pca_var_threshold)
 
@@ -290,8 +295,12 @@ class VariantFeatureBuilder:
         df = df[df["Chromosome"].notna()]
         df["Position"] = df["Position"].astype(int)
         df["Gene"] = df["Gene"].astype(str)
+        df["gene_start"] = pd.to_numeric(df["gene_start"], errors="coerce").astype(int)
+        df["gene_end"] = pd.to_numeric(df["gene_end"], errors="coerce").astype(int)
         df["gwas_trait"] = df["gwas_trait"].fillna("").astype(str)
         df["qtl_trait"] = df["qtl_trait"].fillna("").astype(str)
+        df["REF"] = df["REF"].fillna("").astype(str)
+        df["ALT"] = df["ALT"].fillna("").astype(str)
 
         sample_cols = [col for col in df.columns if col not in self.META_COLUMNS]
         renamed = {}
@@ -319,41 +328,38 @@ class VariantFeatureBuilder:
         return df
 
     def _load_variant_map(self) -> Dict[Tuple[str, int], VariantRecord]:
-        """Load reference and alternative alleles from VCF for all unique sites."""
-        try:
-            import pysam  # type: ignore
-        except Exception as exc:
-            raise ImportError("pysam is required to read VCF") from exc
-
+        """Load reference and alternative alleles from geno_df metadata."""
         assert self.geno_df is not None
-        target_sites = {
-            (str(chrom), int(pos))
-            for chrom, pos in self.geno_df[["Chromosome", "Position"]].drop_duplicates().itertuples(index=False, name=None)
-        }
-
         variant_map: Dict[Tuple[str, int], VariantRecord] = {}
-        vcf = pysam.VariantFile(str(self.vcf_path))
-        for rec in vcf:
-            chrom = standard_chrom(str(rec.chrom))
-            if chrom is None:
-                continue
-            pos = int(rec.pos)
+        uniq_df = (
+            self.geno_df[["Chromosome", "Position", "REF", "ALT"]]
+            .drop_duplicates()
+            .reset_index(drop=True)
+        )
+        for row in uniq_df.itertuples(index=False):
+            chrom = str(row.Chromosome)
+            pos = int(row.Position)
             key = (chrom, pos)
-            if key not in target_sites:
-                continue
-            alt = str(rec.alts[0]) if rec.alts else ""
             variant_map[key] = VariantRecord(
                 chromosome=chrom,
                 position=pos,
-                ref=str(rec.ref),
-                alt=alt,
+                ref=str(row.REF),
+                alt=str(row.ALT),
             )
 
-        self.logger.info("Loaded variant_map: matched=%d target_sites=%d", len(variant_map), len(target_sites))
+        self.logger.info("Loaded variant_map from geno_df: sites=%d", len(variant_map))
         return variant_map
 
     def _feature_name(self, chrom: str, pos: int) -> str:
         return f"{chrom}:{int(pos)}"
+
+    @staticmethod
+    def _chrom_sort_key(chrom: str) -> tuple[int, str]:
+        text = str(chrom)
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if digits:
+            return (int(digits), text)
+        return (10**9, text)
 
     def _ensure_embedder(self) -> None:
         if self.embedder is None:
@@ -444,8 +450,12 @@ class VariantFeatureBuilder:
         """Build a sample-by-site 012 matrix from ``geno_df``."""
         assert self.geno_df is not None
         site_df = (
-            self.geno_df.sort_values(["Chromosome", "Position"])
+            self.geno_df.assign(
+                _chrom_order=self.geno_df["Chromosome"].map(self._chrom_sort_key)
+            )
+            .sort_values(["_chrom_order", "Position"])
             .drop_duplicates(subset=["Chromosome", "Position"])
+            .drop(columns=["_chrom_order"])
             .reset_index(drop=True)
         )
         feature_names = [
@@ -481,93 +491,11 @@ class VariantFeatureBuilder:
             raise KeyError(f"Chromosome {chrom} not found in FASTA references")
         return chrom_map[chrom]
 
-    def _build_extseq_dict(self) -> dict[str, dict[str, str]]:
-        """Build per-site reference and alternative extended sequences."""
-        assert self.geno_df is not None
-        fa = self._get_fasta()
-        fasta_chrom_map = self._build_fasta_chrom_map(fa)
-        extseq_dict: dict[str, dict[str, str]] = {}
-        uniq_sites = (
-            self.geno_df[["Chromosome", "Position"]]
-            .drop_duplicates()
-            .sort_values(["Chromosome", "Position"])
-            .itertuples(index=False, name=None)
-        )
-
-        for chrom, pos in uniq_sites:
-            key = (str(chrom), int(pos))
-            if key not in self.variant_map:
-                continue
-            variant = self.variant_map[key]
-            fasta_chrom = self._resolve_fasta_chrom(variant.chromosome, fasta_chrom_map)
-            left_start = max(1, variant.position - self.flank_k)
-            left_seq = fa.fetch(fasta_chrom, left_start - 1, variant.position - 1)
-            right_start = variant.position + len(variant.ref)
-            right_end = right_start + self.flank_k - 1
-            right_seq = fa.fetch(fasta_chrom, right_start - 1, right_end)
-            site_key = self._feature_name(variant.chromosome, variant.position)
-            extseq_dict[site_key] = {
-                "ref_seq": f"{left_seq}{variant.ref}{right_seq}",
-                "alt_seq": f"{left_seq}{variant.alt}{right_seq}",
-            }
-
-        self._save_json(extseq_dict, self.dict_dir / "site_extseq_dict.json")
-        self.logger.info("Built site_extseq_dict: n=%d", len(extseq_dict))
-        return extseq_dict
-
-    def build_snp_extseq_df(self) -> pd.DataFrame:
-        """Build sample-by-site extended-sequence embedding features."""
-        assert self.geno_df is not None
-        extseq_dict = self._build_extseq_dict()
-        self.logger.info("Embedding SNP extended sequences: sites=%d", len(extseq_dict))
-        embed_dict: Dict[str, np.ndarray] = {}
-        for site_key, seq_dict in extseq_dict.items():
-            embed_dict[f"{site_key}|ref"] = self._embed_sequence(seq_dict["ref_seq"])
-            embed_dict[f"{site_key}|alt"] = self._embed_sequence(seq_dict["alt_seq"])
-        self._save_npz_dict(embed_dict, self.dict_dir / "site_extseq_embedding.npz")
-        self.logger.info(
-            "Finished SNP extended-sequence embedding: total=%d cache_hits=%d cache_misses=%d",
-            self._embed_total,
-            self._embed_cache_hits,
-            self._embed_cache_misses,
-        )
-
-        site_df = (
-            self.geno_df.sort_values(["Chromosome", "Position"])
-            .drop_duplicates(subset=["Chromosome", "Position"])
-            .reset_index(drop=True)
-        )
-        blocks = []
-        columns = ["sample"]
-        for chrom, pos in site_df[["Chromosome", "Position"]].itertuples(index=False, name=None):
-            site_key = self._feature_name(chrom, pos)
-            if site_key not in extseq_dict:
-                continue
-            block = np.vstack(
-                [
-                    embed_dict[f"{site_key}|alt"] * float(gt)
-                    for gt in site_df.loc[
-                        (site_df["Chromosome"] == chrom) & (site_df["Position"] == pos),
-                        self.sample_columns,
-                    ].iloc[0].tolist()
-                ]
-            ).astype(np.float32)
-            reduced, cols = self._fit_pca_block(block, site_key, subdir="snp_extseq")
-            blocks.append(reduced)
-            columns.extend(cols)
-
-        matrix = np.concatenate(blocks, axis=1) if blocks else np.empty((len(self.sample_columns), 0), dtype=np.float32)
-        out_df = pd.DataFrame(matrix, columns=columns[1:])
-        out_df.insert(0, "sample", self.sample_columns)
-        out_df.to_csv(self.outdir / "snp_extseq_df.csv", index=False)
-        self.logger.info("Built snp_extseq_df: shape=%s", out_df.shape)
-        return out_df
-
     def _apply_variants_to_region(
         self,
         reference_seq: str,
         region_start: int,
-        variant_rows: Iterable[pd.Series],
+        variant_rows: Iterable[dict[str, str | int]],
         sample: str,
     ) -> str:
         """Apply sample-specific variants to one reference region."""
@@ -585,74 +513,102 @@ class VariantFeatureBuilder:
             rel_end = rel_start + len(variant.ref)
             if rel_start < 0 or rel_end > len(seq):
                 continue
+            ref_in_seq = seq[rel_start:rel_end]
+            if variant.ref and ref_in_seq and ref_in_seq.upper() != variant.ref.upper():
+                self.logger.warning(
+                    "Reference mismatch for %s:%d expected=%s observed=%s",
+                    variant.chromosome,
+                    variant.position,
+                    variant.ref,
+                    ref_in_seq,
+                )
             seq = f"{seq[:rel_start]}{variant.alt}{seq[rel_end:]}"
             offset += len(variant.alt) - len(variant.ref)
         return seq
 
-    def _build_gene_seq_dict(self) -> dict[str, dict[str, str]]:
-        """Build per-sample per-gene mutated sequences.
-
-        Since only ``geno_df + VCF + FASTA`` are provided, each gene region is
-        defined by the span covered by its variants on the reference genome.
-        """
+    def _build_ref_gene_seq_dict(self) -> dict[str, str]:
+        """Build reference gene sequences from FASTA using gene_start/gene_end."""
         assert self.geno_df is not None
         fa = self._get_fasta()
         fasta_chrom_map = self._build_fasta_chrom_map(fa)
-        gene_seq_dict: dict[str, dict[str, str]] = {sample: {} for sample in self.sample_columns}
+        ref_gene_seq_dict: dict[str, str] = {}
 
         for gene, gene_df in self.geno_df.groupby("Gene", sort=True):
-            gene_df = gene_df.sort_values(["Chromosome", "Position"]).reset_index(drop=True)
+            gene_df = (
+                gene_df.assign(_chrom_order=gene_df["Chromosome"].map(self._chrom_sort_key))
+                .sort_values(["_chrom_order", "Position"])
+                .drop(columns=["_chrom_order"])
+                .reset_index(drop=True)
+            )
             chrom = str(gene_df["Chromosome"].iloc[0])
-            starts = []
-            ends = []
-            for row in gene_df.itertuples(index=False):
-                key = (str(row.Chromosome), int(row.Position))
-                if key not in self.variant_map:
-                    continue
-                starts.append(int(row.Position))
-                ends.append(int(row.Position) + len(self.variant_map[key].ref) - 1)
-            if not starts:
-                continue
-            region_start = min(starts)
-            region_end = max(ends)
+            region_start = int(gene_df["gene_start"].iloc[0])
+            region_end = int(gene_df["gene_end"].iloc[0])
             fasta_chrom = self._resolve_fasta_chrom(chrom, fasta_chrom_map)
-            ref_seq = fa.fetch(fasta_chrom, region_start - 1, region_end)
+            ref_gene_seq_dict[str(gene)] = fa.fetch(fasta_chrom, region_start - 1, region_end)
+
+        self._save_json(ref_gene_seq_dict, self.dict_dir / "ref_gene_seq_dict.json")
+        self.logger.info("Built ref_gene_seq_dict: genes=%d", len(ref_gene_seq_dict))
+        return ref_gene_seq_dict
+
+    def _build_alt_gene_seq_dict(self, ref_gene_seq_dict: dict[str, str]) -> dict[str, dict[str, str]]:
+        """Build sample-specific mutated gene sequences from ref sequences."""
+        assert self.geno_df is not None
+        alt_gene_seq_dict: dict[str, dict[str, str]] = {sample: {} for sample in self.sample_columns}
+
+        for gene, gene_df in self.geno_df.groupby("Gene", sort=True):
+            gene_df = (
+                gene_df.assign(_chrom_order=gene_df["Chromosome"].map(self._chrom_sort_key))
+                .sort_values(["_chrom_order", "Position"])
+                .drop(columns=["_chrom_order"])
+                .reset_index(drop=True)
+            )
+            if str(gene) not in ref_gene_seq_dict:
+                continue
+            region_start = int(gene_df["gene_start"].iloc[0])
             variant_rows = [row._asdict() for row in gene_df.itertuples(index=False)]
+            ref_seq = ref_gene_seq_dict[str(gene)]
 
             for sample in self.sample_columns:
-                gene_seq_dict[sample][str(gene)] = self._apply_variants_to_region(
+                alt_gene_seq_dict[sample][str(gene)] = self._apply_variants_to_region(
                     reference_seq=ref_seq,
                     region_start=region_start,
                     variant_rows=variant_rows,
                     sample=sample,
                 )
 
-        self._save_json(gene_seq_dict, self.dict_dir / "gene_seq_dict.json")
-        self.logger.info("Built gene_seq_dict: samples=%d", len(gene_seq_dict))
-        return gene_seq_dict
+        self._save_json(alt_gene_seq_dict, self.dict_dir / "alt_gene_seq_dict.json")
+        self.logger.info("Built alt_gene_seq_dict: samples=%d genes=%d", len(alt_gene_seq_dict), len(ref_gene_seq_dict))
+        return alt_gene_seq_dict
 
     def build_gene_seq_df(self) -> pd.DataFrame:
         """Build sample-by-gene mutated sequence embedding features."""
-        gene_seq_dict = self._build_gene_seq_dict()
-        genes = sorted({gene for sample_data in gene_seq_dict.values() for gene in sample_data})
+        ref_gene_seq_dict = self._build_ref_gene_seq_dict()
+        alt_gene_seq_dict = self._build_alt_gene_seq_dict(ref_gene_seq_dict)
+        genes = sorted(ref_gene_seq_dict)
         self.logger.info("Embedding gene sequences: genes=%d samples=%d", len(genes), len(self.sample_columns))
-        embed_dict: Dict[str, np.ndarray] = {}
+        embed_dict: Dict[str, Dict[str, List[float]]] = {sample: {} for sample in self.sample_columns}
+        pca_dict: Dict[str, Dict[str, float]] = {sample: {} for sample in self.sample_columns}
         blocks = []
         columns = ["sample"]
 
         for gene in genes:
-            seqs = [gene_seq_dict[sample].get(gene, "") for sample in self.sample_columns]
+            seqs = [alt_gene_seq_dict[sample].get(gene, "") for sample in self.sample_columns]
             embed_block = np.vstack([self._embed_sequence(seq) if seq else np.zeros(1, dtype=np.float32) for seq in seqs])
             # Ensure consistent dimensionality if empty sequences appear.
             if embed_block.ndim == 1:
                 embed_block = embed_block.reshape(-1, 1)
             for sample, seq, vec in zip(self.sample_columns, seqs, embed_block):
-                embed_dict[f"{sample}|{gene}"] = vec.astype(np.float32)
+                embed_dict[sample][gene] = vec.astype(np.float32).tolist()
             reduced, cols = self._fit_pca_block(embed_block, gene, subdir="gene_seq")
+            renamed_cols = [col.replace("_", "-", 1) for col in cols]
+            for sample_idx, sample in enumerate(self.sample_columns):
+                for col_idx, col in enumerate(renamed_cols):
+                    pca_dict[sample][col] = float(reduced[sample_idx, col_idx])
             blocks.append(reduced)
-            columns.extend(cols)
+            columns.extend(renamed_cols)
 
-        self._save_npz_dict(embed_dict, self.dict_dir / "gene_seq_embedding.npz")
+        self._save_json(embed_dict, self.dict_dir / "alt_gene_seq_embedding_dict.json")
+        self._save_json(pca_dict, self.dict_dir / "alt_gene_seq_embedding_pca_dict.json")
         self.logger.info(
             "Finished gene-sequence embedding: total=%d cache_hits=%d cache_misses=%d",
             self._embed_total,
@@ -672,7 +628,6 @@ class VariantFeatureBuilder:
         self.variant_map = self._load_variant_map()
         outputs = {
             "geno012_df": self.build_geno012_df(),
-            "snp_extseq_df": self.build_snp_extseq_df(),
             "gene_seq_df": self.build_gene_seq_df(),
         }
         self.logger.info("VariantFeatureBuilder finished")
@@ -705,11 +660,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_build = subparsers.add_parser(
         "build",
-        help="Build geno012_df, snp_extseq_df, and gene_seq_df from a geno_df CSV",
+        help="Build geno012_df and gene_seq_df from a geno_df CSV",
     )
     p_build.add_argument("--geno_df_path", required=True)
     p_build.add_argument("--fasta_path", required=True)
-    p_build.add_argument("--vcf_path", required=True)
     p_build.add_argument("--outdir", required=True)
     p_build.add_argument("--embedder_type", required=True, choices=["generator", "evo2", "nt", "agront", "rice8k"])
     p_build.add_argument("--model_name_or_path", required=True)
@@ -718,7 +672,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--local_files_only", action="store_true", default=True)
     p_build.add_argument("--no-local_files_only", dest="local_files_only", action="store_false")
     p_build.add_argument("--embedder_kwargs", default=None, help='JSON object string, e.g. \'{"torch_dtype":"bfloat16"}\'')
-    p_build.add_argument("--flank_k", type=int, default=50)
     p_build.add_argument("--use_pca", action="store_true", default=True)
     p_build.add_argument("--no-use_pca", dest="use_pca", action="store_false")
     p_build.add_argument("--pca_var_threshold", type=float, default=0.95)
@@ -741,7 +694,6 @@ def main() -> None:
         builder = VariantFeatureBuilder(
             geno_df_path=args.geno_df_path,
             fasta_path=args.fasta_path,
-            vcf_path=args.vcf_path,
             outdir=args.outdir,
             embedder_type=args.embedder_type,
             model_name_or_path=args.model_name_or_path,
@@ -749,7 +701,6 @@ def main() -> None:
             pooling=args.pooling,
             local_files_only=args.local_files_only,
             embedder_kwargs=_parse_embedder_kwargs(args.embedder_kwargs),
-            flank_k=args.flank_k,
             use_pca=args.use_pca,
             pca_var_threshold=args.pca_var_threshold,
         )
