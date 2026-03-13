@@ -146,6 +146,11 @@ class VariantFeatureBuilder:
         df.to_csv(path, index=False)
         return path
 
+    @staticmethod
+    def _merge_trait_values(values: pd.Series) -> str:
+        uniq = sorted({str(v).strip() for v in values if str(v).strip()})
+        return ";".join(uniq)
+
     def _ensure_embedder(self) -> None:
         if self.embedder is None:
             raise ValueError("embedder or embedder_type must be provided")
@@ -241,11 +246,65 @@ class VariantFeatureBuilder:
             rows.append(out_row)
 
         geno_df = pd.DataFrame(rows, columns=self.GENO_META_COLUMNS + self.sample_columns)
+        geno_df = self._deduplicate_geno_df(geno_df)
         self.geno_df = geno_df
         geno_path = self.outdir / "geno_df.csv"
         geno_df.to_csv(geno_path, index=False)
         self.logger.info("Saved geno_df: %s shape=%s", geno_path, geno_df.shape)
         return geno_df
+
+    def _deduplicate_geno_df(self, geno_df: pd.DataFrame) -> pd.DataFrame:
+        subset = ["Gene", "Chromosome", "Position"]
+        dup_mask = geno_df.duplicated(subset=subset, keep=False)
+        if not dup_mask.any():
+            return geno_df.reset_index(drop=True)
+
+        dup_count = int(dup_mask.sum())
+        self.logger.warning(
+            "Found duplicated gene-site rows in geno_df: rows=%d unique_sites=%d; deduplicating by %s",
+            dup_count,
+            int(geno_df.loc[dup_mask, subset].drop_duplicates().shape[0]),
+            "+".join(subset),
+        )
+
+        for row in (
+            geno_df.loc[dup_mask, ["Gene", "Chromosome", "Position", "REF", "ALT"]]
+            .drop_duplicates()
+            .itertuples(index=False)
+        ):
+            group = geno_df[
+                (geno_df["Gene"] == row.Gene)
+                & (geno_df["Chromosome"] == row.Chromosome)
+                & (geno_df["Position"] == row.Position)
+            ]
+            if group["REF"].nunique(dropna=False) > 1 or group["ALT"].nunique(dropna=False) > 1:
+                self.logger.warning(
+                    "Inconsistent duplicated site for %s at %s:%d REF=%s ALT=%s",
+                    row.Gene,
+                    row.Chromosome,
+                    int(row.Position),
+                    sorted(group["REF"].astype(str).unique().tolist()),
+                    sorted(group["ALT"].astype(str).unique().tolist()),
+                )
+
+        agg: dict[str, str] = {
+            "gene_start": "first",
+            "gene_end": "first",
+            "REF": "first",
+            "ALT": "first",
+            "qtl_trait": self._merge_trait_values,
+            "gwas_trait": self._merge_trait_values,
+        }
+        agg.update({sample: "max" for sample in self.sample_columns})
+
+        out = (
+            geno_df.groupby(subset, as_index=False, sort=False)
+            .agg(agg)
+            .loc[:, self.GENO_META_COLUMNS + self.sample_columns]
+            .reset_index(drop=True)
+        )
+        self.logger.info("Deduplicated geno_df by %s: %d -> %d rows", "+".join(subset), len(geno_df), len(out))
+        return out
 
     def _get_fasta(self):
         try:
@@ -330,6 +389,41 @@ class VariantFeatureBuilder:
         self.geno_df.to_csv(out_path, index=False)
         self.logger.info("Saved geno_df_with_gene_seq: %s shape=%s", out_path, self.geno_df.shape)
 
+    def _validate_variant_ref_in_gene_seq(
+        self,
+        reference_seq: str,
+        gene_start: int,
+        row: dict[str, str | int],
+    ) -> tuple[int, int] | None:
+        pos = int(row["Position"])
+        ref = str(row["REF"])
+        rel_start = pos - gene_start
+        rel_end = rel_start + len(ref)
+        if rel_start < 0 or rel_end > len(reference_seq):
+            self.logger.warning(
+                "Variant out of gene bounds for %s at %s:%d gene_start=%d gene_len=%d ref=%s",
+                row["Gene"],
+                row["Chromosome"],
+                pos,
+                gene_start,
+                len(reference_seq),
+                ref,
+            )
+            return None
+
+        observed = reference_seq[rel_start:rel_end]
+        if ref and observed.upper() != ref.upper():
+            self.logger.warning(
+                "REF mismatch between VCF and gene reference for %s at %s:%d expected=%s observed=%s",
+                row["Gene"],
+                row["Chromosome"],
+                pos,
+                ref,
+                observed,
+            )
+            return None
+        return rel_start, rel_end
+
     def _apply_variants_to_gene(
         self,
         reference_seq: str,
@@ -343,13 +437,16 @@ class VariantFeatureBuilder:
         for row in rows:
             if int(row[sample]) <= 0:
                 continue
-            pos = int(row["Position"])
-            ref = str(row["REF"])
             alt = str(row["ALT"])
-            rel_start = pos - gene_start
-            rel_end = rel_start + len(ref)
-            if rel_start < 0 or rel_end > len(reference_seq):
+            validated_span = self._validate_variant_ref_in_gene_seq(
+                reference_seq=reference_seq,
+                gene_start=gene_start,
+                row=row,
+            )
+            if validated_span is None:
                 continue
+            pos = int(row["Position"])
+            rel_start, rel_end = validated_span
             if rel_start < cursor:
                 self.logger.warning(
                     "Overlapping variants for %s at %s:%d; skipping current variant",
@@ -358,16 +455,6 @@ class VariantFeatureBuilder:
                     pos,
                 )
                 continue
-            observed = reference_seq[rel_start:rel_end]
-            if ref and observed.upper() != ref.upper():
-                self.logger.warning(
-                    "Gene sequence replacement mismatch for %s at %s:%d expected=%s observed=%s",
-                    row["Gene"],
-                    row["Chromosome"],
-                    pos,
-                    ref,
-                    observed,
-                )
             parts.append(reference_seq[cursor:rel_start])
             parts.append(alt)
             cursor = rel_end
