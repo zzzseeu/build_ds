@@ -337,8 +337,8 @@ class VariantFeatureBuilder:
         variant_rows: Iterable[dict[str, str | int]],
         sample: str,
     ) -> str:
-        seq = reference_seq
-        offset = 0
+        parts: list[str] = []
+        cursor = 0
         rows = sorted(list(variant_rows), key=lambda x: int(x["Position"]))
         for row in rows:
             if int(row[sample]) <= 0:
@@ -346,11 +346,19 @@ class VariantFeatureBuilder:
             pos = int(row["Position"])
             ref = str(row["REF"])
             alt = str(row["ALT"])
-            rel_start = pos - gene_start + offset
+            rel_start = pos - gene_start
             rel_end = rel_start + len(ref)
-            if rel_start < 0 or rel_end > len(seq):
+            if rel_start < 0 or rel_end > len(reference_seq):
                 continue
-            observed = seq[rel_start:rel_end]
+            if rel_start < cursor:
+                self.logger.warning(
+                    "Overlapping variants for %s at %s:%d; skipping current variant",
+                    row["Gene"],
+                    row["Chromosome"],
+                    pos,
+                )
+                continue
+            observed = reference_seq[rel_start:rel_end]
             if ref and observed.upper() != ref.upper():
                 self.logger.warning(
                     "Gene sequence replacement mismatch for %s at %s:%d expected=%s observed=%s",
@@ -360,9 +368,11 @@ class VariantFeatureBuilder:
                     ref,
                     observed,
                 )
-            seq = f"{seq[:rel_start]}{alt}{seq[rel_end:]}"
-            offset += len(alt) - len(ref)
-        return seq
+            parts.append(reference_seq[cursor:rel_start])
+            parts.append(alt)
+            cursor = rel_end
+        parts.append(reference_seq[cursor:])
+        return "".join(parts)
 
     def build_gene_sequence_matrix(self) -> pd.DataFrame:
         assert self.geno_df is not None
