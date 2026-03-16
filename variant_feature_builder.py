@@ -18,6 +18,11 @@ import pandas as pd
 from logging import init_logger
 from utils import standard_chrom, standard_sample_name
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - fallback when tqdm is unavailable
+    tqdm = None
+
 
 class VariantFeatureBuilder:
     """End-to-end pipeline from site CSV + VCF + FASTA to downstream matrices."""
@@ -154,6 +159,12 @@ class VariantFeatureBuilder:
     def _ensure_embedder(self) -> None:
         if self.embedder is None:
             raise ValueError("embedder or embedder_type must be provided")
+
+    @staticmethod
+    def _progress(iterable, **kwargs):
+        if tqdm is None:
+            return iterable
+        return tqdm(iterable, **kwargs)
 
     def _load_site_df(self) -> pd.DataFrame:
         df = self.site_df.copy() if self.site_df is not None else pd.read_csv(self.site_df_path)
@@ -466,8 +477,19 @@ class VariantFeatureBuilder:
         ref_gene_seq_dict = self._build_ref_gene_seq_dict()
         self._append_gene_seq_column(ref_gene_seq_dict)
         gene_seq_dict: dict[str, dict[str, str]] = {sample: {} for sample in self.sample_columns}
+        grouped_items = list(self.geno_df.groupby("Gene", sort=True))
+        self.logger.info(
+            "Building gene sequences: genes=%d samples=%d",
+            len(grouped_items),
+            len(self.sample_columns),
+        )
 
-        for gene, gene_df in self.geno_df.groupby("Gene", sort=True):
+        for gene, gene_df in self._progress(
+            grouped_items,
+            desc="Building gene sequences",
+            total=len(grouped_items),
+            unit="gene",
+        ):
             gene_df = gene_df.sort_values(["Position"]).reset_index(drop=True)
             gene_start = int(gene_df["gene_start"].iloc[0])
             reference_seq = ref_gene_seq_dict[str(gene)]
@@ -548,20 +570,61 @@ class VariantFeatureBuilder:
         pca = PCA(n_components=n_comp, svd_solver="full")
         reduced = pca.fit_transform(block).astype(np.float32)
         joblib.dump(pca, self.pca_dir / f"{gene}.joblib")
+        self.logger.info(
+            "Fitted PCA for gene=%s samples=%d input_dim=%d output_dim=%d var_threshold=%.3f explained=%.4f",
+            gene,
+            block.shape[0],
+            block.shape[1],
+            reduced.shape[1],
+            self.pca_var_threshold,
+            float(cum[n_comp - 1]),
+        )
         return reduced, [f"{gene}-PC{i + 1}" for i in range(reduced.shape[1])]
 
     def build_gene_feature_matrix(self, gene_sequence_df: pd.DataFrame) -> pd.DataFrame:
         self._ensure_embedder()
         seq_values = gene_sequence_df.iloc[:, 1:].to_numpy().ravel()
         unique_sequences = sorted({str(seq) for seq in seq_values if str(seq) != ""})
-        seq_embed_dict = {seq: self._embed_sequence(seq).tolist() for seq in unique_sequences}
+        self._embed_total = 0
+        self._embed_cache_hits = 0
+        self._embed_cache_misses = 0
+        self.logger.info(
+            "Building gene feature matrix: samples=%d genes=%d unique_sequences=%d embedder_type=%s model=%s use_pca=%s",
+            len(gene_sequence_df),
+            max(0, gene_sequence_df.shape[1] - 1),
+            len(unique_sequences),
+            self.embedder_type,
+            self.model_name_or_path,
+            self.use_pca,
+        )
+        seq_embed_dict: dict[str, list[float]] = {}
+        for seq in self._progress(
+            unique_sequences,
+            desc="Embedding unique gene sequences",
+            total=len(unique_sequences),
+            unit="seq",
+        ):
+            seq_embed_dict[seq] = self._embed_sequence(seq).tolist()
         self._save_json(seq_embed_dict, self.dict_dir / "unique_gene_sequence_embedding_dict.json")
+        self.logger.info(
+            "Embedding completed: total=%d cache_hits=%d cache_misses=%d cache_hit_rate=%.2f%%",
+            self._embed_total,
+            self._embed_cache_hits,
+            self._embed_cache_misses,
+            100.0 * self._embed_cache_hits / self._embed_total if self._embed_total else 0.0,
+        )
 
         blocks: list[np.ndarray] = []
         columns = ["sample"]
         gene_feature_dict: dict[str, dict[str, list[float] | float]] = {sample: {} for sample in gene_sequence_df["sample"].tolist()}
 
-        for gene in gene_sequence_df.columns[1:]:
+        gene_columns = gene_sequence_df.columns[1:].tolist()
+        for gene in self._progress(
+            gene_columns,
+            desc="Projecting gene embeddings",
+            total=len(gene_columns),
+            unit="gene",
+        ):
             seqs = gene_sequence_df[gene].astype(str).tolist()
             embed_block = np.vstack([np.asarray(seq_embed_dict[seq], dtype=np.float32) for seq in seqs])
             for sample, vec in zip(gene_sequence_df["sample"].tolist(), embed_block):

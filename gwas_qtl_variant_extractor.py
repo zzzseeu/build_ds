@@ -6,6 +6,7 @@ All genomic coordinates are treated as 1-based.
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,11 @@ from utils import (
     standard_sample_name,
 )
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - fallback when tqdm is unavailable
+    tqdm = None
+
 
 @dataclass
 class Interval:
@@ -30,6 +36,7 @@ class Interval:
     start: int
     end: int
     trait: str
+    pvalue: float
 
     def contains(self, pos: int) -> bool:
         return self.start <= pos <= self.end
@@ -42,26 +49,28 @@ class IntervalTree:
         self.intervals: List[Interval] = []
         self._built = False
 
-    def add(self, start: int, end: int, trait: str) -> None:
+    def add(self, start: int, end: int, trait: str, pvalue: float) -> None:
         if start > end:
             start, end = end, start
-        self.intervals.append(Interval(start=start, end=end, trait=trait))
+        self.intervals.append(Interval(start=start, end=end, trait=trait, pvalue=float(pvalue)))
         self._built = False
 
     def build(self) -> None:
         self.intervals.sort(key=lambda x: (x.start, x.end))
         self._built = True
 
-    def query_traits(self, pos: int) -> Set[str]:
+    def query_traits(self, pos: int) -> Dict[str, float]:
         if not self._built:
             self.build()
-        traits: Set[str] = set()
+        trait_pvalues: Dict[str, float] = {}
         for iv in self.intervals:
             if iv.start > pos:
                 break
             if iv.contains(pos):
-                traits.add(iv.trait)
-        return traits
+                current = trait_pvalues.get(iv.trait)
+                if current is None or iv.pvalue < current:
+                    trait_pvalues[iv.trait] = iv.pvalue
+        return trait_pvalues
 
 
 class GWASQTLVariantExtractor:
@@ -107,6 +116,26 @@ class GWASQTLVariantExtractor:
         self.outprefix.parent.mkdir(parents=True, exist_ok=True)
         log_path = self.outprefix.parent / f"{self.outprefix.name}_{datetime.now().strftime('%Y-%m-%d')}.log"
         self.logger = init_logger("GWASQTLVariantExtractor", log_file=log_path)
+
+    @staticmethod
+    def _progress(iterable, **kwargs):
+        if tqdm is None:
+            return iterable
+        return tqdm(iterable, **kwargs)
+
+    @staticmethod
+    def _lod_to_pvalue(lod: float) -> float:
+        chi2_stat = 2.0 * math.log(10.0) * float(lod)
+        return math.erfc(math.sqrt(max(chi2_stat, 0.0) / 2.0))
+
+    @staticmethod
+    def _format_trait_values(trait_to_value: Dict[str, float]) -> tuple[str, str]:
+        if not trait_to_value:
+            return "", ""
+        items = sorted((trait, float(value)) for trait, value in trait_to_value.items())
+        traits = ",".join(trait for trait, _ in items)
+        values = ",".join(f"{value:.12g}" for _, value in items)
+        return traits, values
 
     @staticmethod
     def _parse_trait_filter(trait: str | None) -> Set[str] | None:
@@ -171,6 +200,7 @@ class GWASQTLVariantExtractor:
         df["Trait"] = df["Trait"].astype(str)
         df["LOD"] = pd.to_numeric(df["LOD"], errors="coerce")
         df["PVE"] = pd.to_numeric(df["PVE"], errors="coerce")
+        df["qtl_pvalue"] = df["LOD"].map(self._lod_to_pvalue)
 
         df = df[(df["LOD"] > self.lod_threshold) & (df["PVE"] > self.pve_threshold)]
         df = df[df["start_pos"].notna() & df["end_pos"].notna()]
@@ -182,18 +212,19 @@ class GWASQTLVariantExtractor:
             df = df[df["Trait"].isin(self.trait_set)]
 
         self.logger.info("QTL loaded: shape=%s", df.shape)
+        self.logger.info("QTL pvalue conversion uses chi-square(df=1) approximation from LOD")
         return df
 
     def _build_qtl_trees(self, qtl_df: pd.DataFrame) -> Dict[str, IntervalTree]:
         trees: Dict[str, IntervalTree] = {}
-        for row in qtl_df.itertuples(index=False):
+        for row in self._progress(qtl_df.itertuples(index=False), total=len(qtl_df), desc="Building QTL trees", unit="qtl"):
             chrom = str(row.Chromosome)
             start = int(row.start_pos)
             end = int(row.end_pos)
             trait = str(row.Trait)
             if chrom not in trees:
                 trees[chrom] = IntervalTree()
-            trees[chrom].add(start, end, trait)
+            trees[chrom].add(start, end, trait, float(row.qtl_pvalue))
 
         for tree in trees.values():
             tree.build()
@@ -201,17 +232,21 @@ class GWASQTLVariantExtractor:
         self.logger.info("QTL interval trees built: chromosomes=%d", len(trees))
         return trees
 
-    @staticmethod
-    def _build_gwas_site_map(gwas_df: pd.DataFrame) -> Dict[Tuple[str, int], Set[str]]:
-        site_map: Dict[Tuple[str, int], Set[str]] = {}
-        for row in gwas_df.itertuples(index=False):
+    def _build_gwas_site_map(self, gwas_df: pd.DataFrame) -> Dict[Tuple[str, int], Dict[str, float]]:
+        site_map: Dict[Tuple[str, int], Dict[str, float]] = {}
+        for row in self._progress(gwas_df.itertuples(index=False), total=len(gwas_df), desc="Building GWAS site map", unit="site"):
             key = (str(row.Chromosome), int(row.Position))
-            site_map.setdefault(key, set()).add(str(row.Trait))
+            trait = str(row.Trait)
+            pvalue = float(row.pvalue)
+            trait_map = site_map.setdefault(key, {})
+            current = trait_map.get(trait)
+            if current is None or pvalue < current:
+                trait_map[trait] = pvalue
         return site_map
 
     def _extract_from_vcf(
         self,
-        gwas_site_map: Dict[Tuple[str, int], Set[str]],
+        gwas_site_map: Dict[Tuple[str, int], Dict[str, float]],
         qtl_trees: Dict[str, IntervalTree],
     ) -> pd.DataFrame:
         try:
@@ -219,12 +254,12 @@ class GWASQTLVariantExtractor:
         except Exception as exc:
             raise ImportError("pysam is required to read VCF") from exc
 
-        rows: List[Tuple[str, int, str, str]] = []
+        rows: List[Tuple[str, int, str, str, str, str]] = []
         seen = 0
         kept = 0
 
         vcf = pysam.VariantFile(str(self.vcf_path))
-        for rec in vcf:
+        for rec in self._progress(vcf, desc="Scanning VCF", unit="var"):
             seen += 1
             chrom = standard_chrom(str(rec.chrom))
             if chrom is None:
@@ -232,30 +267,39 @@ class GWASQTLVariantExtractor:
             pos = int(rec.pos)  # 1-based
             key = (chrom, pos)
 
-            g_traits = gwas_site_map.get(key, set())
-            q_traits = qtl_trees.get(chrom, IntervalTree()).query_traits(pos) if chrom in qtl_trees else set()
+            g_trait_values = gwas_site_map.get(key, {})
+            q_trait_values = qtl_trees[chrom].query_traits(pos) if chrom in qtl_trees else {}
 
             if self.type == "intersect":
-                keep_site = bool(g_traits & q_traits)
+                shared_traits = sorted(set(g_trait_values) & set(q_trait_values))
+                g_trait_values = {trait: g_trait_values[trait] for trait in shared_traits}
+                q_trait_values = {trait: q_trait_values[trait] for trait in shared_traits}
+                keep_site = bool(shared_traits)
             else:
-                keep_site = bool(g_traits or q_traits)
+                keep_site = bool(g_trait_values or q_trait_values)
 
             if keep_site:
                 kept += 1
+                gwas_trait, gwas_pvalue = self._format_trait_values(g_trait_values)
+                qtl_trait, qtl_pvalue = self._format_trait_values(q_trait_values)
                 rows.append(
                     (
                         chrom,
                         pos,
-                        ",".join(sorted(g_traits)),
-                        ",".join(sorted(q_traits)),
+                        gwas_trait,
+                        qtl_trait,
+                        gwas_pvalue,
+                        qtl_pvalue,
                     )
                 )
 
             if seen % 100000 == 0:
                 self.logger.info("VCF scan progress: seen=%d kept_sites=%d", seen, kept)
 
-        out_df = pd.DataFrame(rows, columns=["Chromosome", "Position", "gwas_trait", "qtl_trait"])
-        out_df = out_df.drop_duplicates().sort_values(["Chromosome", "Position", "gwas_trait", "qtl_trait"]).reset_index(drop=True)
+        out_df = pd.DataFrame(rows, columns=["Chromosome", "Position", "gwas_trait", "qtl_trait", "gwas_pvalue", "qtl_pvalue"])
+        out_df = out_df.drop_duplicates().sort_values(
+            ["Chromosome", "Position", "gwas_trait", "qtl_trait", "gwas_pvalue", "qtl_pvalue"]
+        ).reset_index(drop=True)
 
         self.logger.info("VCF extraction done: seen=%d output_rows=%d", seen, len(out_df))
         return out_df
@@ -314,8 +358,13 @@ class GWASQTLVariantExtractor:
         if feature_trees is None:
             return site_df
 
-        rows: list[tuple[str, int, str, int, int, str, str]] = []
-        for row in site_df.itertuples(index=False):
+        rows: list[tuple[str, int, str, int, int, str, str, str, str]] = []
+        for row in self._progress(
+            site_df.itertuples(index=False),
+            total=len(site_df),
+            desc="Mapping sites to features",
+            unit="site",
+        ):
             hits = query_feature_interval_trees(
                 interval_trees=feature_trees,
                 chromosome=str(row.Chromosome),
@@ -333,16 +382,18 @@ class GWASQTLVariantExtractor:
                         int(hit.get("end", 0)),
                         str(row.gwas_trait),
                         str(row.qtl_trait),
+                        str(row.gwas_pvalue),
+                        str(row.qtl_pvalue),
                     )
                 )
 
         out_df = pd.DataFrame(
             rows,
-            columns=["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait"],
+            columns=["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait", "gwas_pvalue", "qtl_pvalue"],
         )
         out_df = out_df[(out_df["Position"] >= out_df["gene_start"]) & (out_df["Position"] <= out_df["gene_end"])]
         out_df = out_df.drop_duplicates().sort_values(
-            ["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait"]
+            ["Chromosome", "Position", "Gene", "gene_start", "gene_end", "gwas_trait", "qtl_trait", "gwas_pvalue", "qtl_pvalue"]
         ).reset_index(drop=True)
         self.logger.info("Feature-filtered output built: rows=%d", len(out_df))
         return out_df
