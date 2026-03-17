@@ -10,6 +10,7 @@ import argparse
 import gc
 import hashlib
 import json
+import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -24,6 +25,11 @@ try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover - fallback when tqdm is unavailable
     tqdm = None
+
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None
 
 
 class VariantFeatureBuilder:
@@ -161,6 +167,68 @@ class VariantFeatureBuilder:
         df.to_parquet(parquet_path, index=False)
         return csv_path, parquet_path
 
+    def _write_chunked_dual_matrix(
+        self,
+        matrix,
+        sample_list: list[str],
+        columns: list[str],
+        path_without_suffix: Path,
+        chunk_rows: int = 256,
+    ) -> tuple[Path, Path]:
+        csv_path = path_without_suffix.with_suffix(".csv")
+        parquet_path = path_without_suffix.with_suffix(".parquet")
+
+        parquet_writer = None
+        parquet_mode = None
+        try:
+            import pyarrow as pa  # type: ignore
+            import pyarrow.parquet as pq  # type: ignore
+
+            parquet_mode = "pyarrow"
+        except Exception:
+            try:
+                import fastparquet  # type: ignore
+
+                parquet_mode = "fastparquet"
+            except Exception:
+                parquet_mode = None
+
+        if parquet_mode is None:
+            raise ImportError(
+                "Writing gene_feature_matrix.parquet in low-memory mode requires pyarrow or fastparquet."
+            )
+
+        for start in range(0, len(sample_list), chunk_rows):
+            end = min(start + chunk_rows, len(sample_list))
+            chunk_df = pd.DataFrame(np.asarray(matrix[start:end]), columns=columns)
+            chunk_df.insert(0, "sample", sample_list[start:end])
+            chunk_df.to_csv(csv_path, mode="w" if start == 0 else "a", header=(start == 0), index=False)
+
+            if parquet_mode == "pyarrow":
+                import pyarrow as pa  # type: ignore
+                import pyarrow.parquet as pq  # type: ignore
+
+                table = pa.Table.from_pandas(chunk_df, preserve_index=False)
+                if parquet_writer is None:
+                    parquet_writer = pq.ParquetWriter(parquet_path, table.schema)
+                parquet_writer.write_table(table)
+            else:
+                import fastparquet  # type: ignore
+
+                fastparquet.write(
+                    parquet_path,
+                    chunk_df,
+                    append=(start != 0),
+                    write_index=False,
+                )
+
+            del chunk_df
+            gc.collect()
+
+        if parquet_writer is not None:
+            parquet_writer.close()
+        return csv_path, parquet_path
+
     @staticmethod
     def _merge_trait_values(values: pd.Series) -> str:
         uniq = sorted({str(v).strip() for v in values if str(v).strip()})
@@ -175,6 +243,32 @@ class VariantFeatureBuilder:
         if tqdm is None:
             return iterable
         return tqdm(iterable, **kwargs)
+
+    @staticmethod
+    def _current_memory_gb() -> float | None:
+        if psutil is not None:
+            try:
+                return psutil.Process().memory_info().rss / (1024 ** 3)
+            except Exception:
+                pass
+        try:
+            import resource
+
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            if sys.platform == "darwin":
+                return rss / (1024 ** 3)
+            return rss / (1024 ** 2)
+        except Exception:
+            return None
+
+    def _memory_str(self) -> str:
+        value = self._current_memory_gb()
+        if value is None:
+            return "memory=NA"
+        return f"memory={value:.2f}GB"
+
+    def _log_memory(self, message: str, *args) -> None:
+        self.logger.info(f"{message} | %s", *args, self._memory_str())
 
     def _load_site_df(self) -> pd.DataFrame:
         df = self.site_df.copy() if self.site_df is not None else pd.read_csv(self.site_df_path)
@@ -207,7 +301,8 @@ class VariantFeatureBuilder:
             .drop_duplicates()
             .reset_index(drop=True)
         )
-        self.logger.info("Loaded site_df: shape=%s", df.shape)
+        self.logger.info("_load_site_df: loaded site_df shape=%s", df.shape)
+        self._log_memory("_load_site_df: completed shape=%s", df.shape)
         self.site_df_loaded = df
         return df
 
@@ -229,7 +324,8 @@ class VariantFeatureBuilder:
         self.sample_columns = [sample_map[s] for s in raw_samples]
 
         genotype_map: dict[tuple[str, int], dict[str, str | int]] = {}
-        for rec in self._progress(vcf, desc="Scanning VCF records", unit="record"):
+        vcf_iter = self._progress(vcf, desc="Scanning VCF records", unit="record")
+        for idx, rec in enumerate(vcf_iter, start=1):
             chrom = standard_chrom(str(rec.chrom))
             if chrom is None:
                 continue
@@ -247,14 +343,23 @@ class VariantFeatureBuilder:
                 for sample in raw_samples
             })
             genotype_map[key] = row_map
+            if idx % 100000 == 0:
+                if hasattr(vcf_iter, "set_postfix_str"):
+                    vcf_iter.set_postfix_str(self._memory_str())
+                self._log_memory(
+                    "_build_geno_df: VCF scan progress scanned=%d matched_sites=%d",
+                    idx,
+                    len(genotype_map),
+                )
 
         rows: list[dict[str, str | int]] = []
-        for row in self._progress(
+        row_iter = self._progress(
             site_df.itertuples(index=False),
             total=len(site_df),
             desc="Building geno_df rows",
             unit="row",
-        ):
+        )
+        for idx, row in enumerate(row_iter, start=1):
             key = (str(row.Chromosome), int(row.Position))
             site_gt = genotype_map.get(key, {"REF": "", "ALT": "", **{sample: 0 for sample in self.sample_columns}})
             out_row: dict[str, str | int] = {
@@ -270,15 +375,22 @@ class VariantFeatureBuilder:
             }
             out_row.update({sample: int(site_gt.get(sample, 0)) for sample in self.sample_columns})
             rows.append(out_row)
+            if idx % 100000 == 0:
+                if hasattr(row_iter, "set_postfix_str"):
+                    row_iter.set_postfix_str(self._memory_str())
+                self._log_memory("_build_geno_df: geno_df row build progress rows=%d", idx)
 
         geno_df = pd.DataFrame(rows, columns=self.GENO_META_COLUMNS + self.sample_columns)
+        del rows
+        del genotype_map
+        gc.collect()
         geno_df = self._deduplicate_geno_df(geno_df)
         if self.sample_columns:
             geno_df[self.sample_columns] = geno_df[self.sample_columns].astype(np.int8)
         self.geno_df = geno_df
         geno_path = self.outdir / "geno_df.csv"
         geno_df.to_csv(geno_path, index=False)
-        self.logger.info("Saved geno_df: %s shape=%s", geno_path, geno_df.shape)
+        self.logger.info("_build_geno_df: saved geno_df path=%s shape=%s", geno_path, geno_df.shape)
         return geno_df
 
     def _deduplicate_geno_df(self, geno_df: pd.DataFrame) -> pd.DataFrame:
@@ -289,7 +401,7 @@ class VariantFeatureBuilder:
 
         dup_count = int(dup_mask.sum())
         self.logger.warning(
-            "Found duplicated gene-site rows in geno_df: rows=%d unique_sites=%d; deduplicating by %s",
+            "_deduplicate_geno_df: found duplicated gene-site rows rows=%d unique_sites=%d deduplicating_by=%s",
             dup_count,
             int(geno_df.loc[dup_mask, subset].drop_duplicates().shape[0]),
             "+".join(subset),
@@ -312,7 +424,7 @@ class VariantFeatureBuilder:
             ]
             if group["REF"].nunique(dropna=False) > 1 or group["ALT"].nunique(dropna=False) > 1:
                 self.logger.warning(
-                    "Inconsistent duplicated site for %s at %s:%d REF=%s ALT=%s",
+                    "_deduplicate_geno_df: inconsistent duplicated site gene=%s chrom=%s pos=%d REF=%s ALT=%s",
                     row.Gene,
                     row.Chromosome,
                     int(row.Position),
@@ -336,7 +448,12 @@ class VariantFeatureBuilder:
             .loc[:, self.GENO_META_COLUMNS + self.sample_columns]
             .reset_index(drop=True)
         )
-        self.logger.info("Deduplicated geno_df by %s: %d -> %d rows", "+".join(subset), len(geno_df), len(out))
+        self.logger.info(
+            "_deduplicate_geno_df: deduplicated by %s rows=%d->%d",
+            "+".join(subset),
+            len(geno_df),
+            len(out),
+        )
         return out
 
     def _get_fasta(self):
@@ -360,7 +477,7 @@ class VariantFeatureBuilder:
             raise KeyError(f"Chromosome {chrom} not found in FASTA")
         return chrom_map[chrom]
 
-    def build_genotype_012(self) -> pd.DataFrame:
+    def build_genotype_012(self) -> dict[str, object]:
         assert self.geno_df is not None
         site_df = self.geno_df.drop_duplicates(subset=["Chromosome", "Position"]).reset_index(drop=True)
         feature_names = [f"{chrom}:{pos}" for chrom, pos in site_df[["Chromosome", "Position"]].itertuples(index=False, name=None)]
@@ -369,15 +486,22 @@ class VariantFeatureBuilder:
         out_df.insert(0, "sample", self.sample_columns)
         csv_path, parquet_path = self._save_matrix_dual(out_df, self.outdir / "genotype_012")
         self.logger.info(
-            "Saved genotype_012: csv=%s parquet=%s shape=%s",
+            "build_genotype_012: saved genotype_012 csv=%s parquet=%s shape=%s",
             csv_path,
             parquet_path,
             out_df.shape,
         )
+        self._log_memory("build_genotype_012: saved shape=%s", out_df.shape)
+        meta = {
+            "shape": tuple(out_df.shape),
+            "csv_path": str(csv_path),
+            "parquet_path": str(parquet_path),
+        }
+        del out_df
         del matrix
         del site_df
         gc.collect()
-        return out_df
+        return meta
 
     def _validate_variant_ref_in_gene_seq(
         self,
@@ -391,7 +515,7 @@ class VariantFeatureBuilder:
         rel_end = rel_start + len(ref)
         if rel_start < 0 or rel_end > len(reference_seq):
             self.logger.warning(
-                "Variant out of gene bounds for %s at %s:%d gene_start=%d gene_len=%d ref=%s",
+                "_validate_variant_ref_in_gene_seq: variant out of gene bounds gene=%s chrom=%s pos=%d gene_start=%d gene_len=%d ref=%s",
                 row["Gene"],
                 row["Chromosome"],
                 pos,
@@ -404,7 +528,7 @@ class VariantFeatureBuilder:
         observed = reference_seq[rel_start:rel_end]
         if ref and observed.upper() != ref.upper():
             self.logger.warning(
-                "REF mismatch between VCF and gene reference for %s at %s:%d expected=%s observed=%s",
+                "_validate_variant_ref_in_gene_seq: REF mismatch gene=%s chrom=%s pos=%d expected=%s observed=%s",
                 row["Gene"],
                 row["Chromosome"],
                 pos,
@@ -439,7 +563,7 @@ class VariantFeatureBuilder:
             rel_start, rel_end = validated_span
             if rel_start < cursor:
                 self.logger.warning(
-                    "Overlapping variants for %s at %s:%d; skipping current variant",
+                    "_apply_variants_to_gene: overlapping variant gene=%s chrom=%s pos=%d skipping current variant",
                     row["Gene"],
                     row["Chromosome"],
                     pos,
@@ -465,7 +589,7 @@ class VariantFeatureBuilder:
         variant_rows = [row._asdict() for row in gene_df.itertuples(index=False)]
         active_samples = sum(bool(int(gene_df[sample].fillna(0).gt(0).any())) for sample in self.sample_columns)
         self.logger.info(
-            "Applying gene variants: gene=%s variant_rows=%d active_samples=%d",
+            "_build_sample_gene_sequences: applying gene variants gene=%s variant_rows=%d active_samples=%d",
             gene,
             len(variant_rows),
             active_samples,
@@ -511,7 +635,7 @@ class VariantFeatureBuilder:
 
         if self._embed_total % self.embed_log_every == 0:
             self.logger.info(
-                "Embedding progress: total=%d cache_hits=%d cache_misses=%d",
+                "_embed_sequence: progress total=%d cache_hits=%d cache_misses=%d",
                 self._embed_total,
                 self._embed_cache_hits,
                 self._embed_cache_misses,
@@ -545,7 +669,7 @@ class VariantFeatureBuilder:
         reduced = pca.fit_transform(block).astype(np.float32)
         joblib.dump(pca, self.pca_dir / f"{gene}.joblib")
         self.logger.info(
-            "Fitted PCA for gene=%s samples=%d input_dim=%d output_dim=%d var_threshold=%.3f explained=%.4f",
+            "_fit_pca_block: fitted PCA gene=%s samples=%d input_dim=%d output_dim=%d var_threshold=%.3f explained=%.4f",
             gene,
             block.shape[0],
             block.shape[1],
@@ -555,7 +679,7 @@ class VariantFeatureBuilder:
         )
         return reduced, [f"{gene}-PC{i + 1}" for i in range(reduced.shape[1])]
 
-    def build_gene_feature_matrix(self) -> pd.DataFrame:
+    def build_gene_feature_matrix(self) -> dict[str, object]:
         self._ensure_embedder()
         assert self.geno_df is not None
         self._embed_total = 0
@@ -567,7 +691,7 @@ class VariantFeatureBuilder:
         grouped = self.geno_df.groupby("Gene", sort=True)
         gene_count = int(self.geno_df["Gene"].nunique())
         self.logger.info(
-            "Building gene feature matrix: samples=%d genes=%d embedder_type=%s model=%s use_pca=%s",
+            "build_gene_feature_matrix: building matrix samples=%d genes=%d embedder_type=%s model=%s use_pca=%s",
             len(sample_list),
             gene_count,
             self.embedder_type,
@@ -578,12 +702,13 @@ class VariantFeatureBuilder:
         total_feature_cols = 0
         with tempfile.TemporaryDirectory(dir=self.outdir, prefix="gene_feature_blocks_") as tempdir_name:
             tempdir = Path(tempdir_name)
-            for gene, gene_df in self._progress(
+            gene_iter = self._progress(
                 grouped,
                 desc="Projecting gene embeddings",
                 total=gene_count,
                 unit="gene",
-            ):
+            )
+            for idx, (gene, gene_df) in enumerate(gene_iter, start=1):
                 seqs = self._build_sample_gene_sequences(str(gene), gene_df, fasta, chrom_map)
                 unique_gene_sequences = sorted({seq for seq in seqs if seq})
                 gene_embed_cache = {
@@ -591,7 +716,7 @@ class VariantFeatureBuilder:
                     for seq in unique_gene_sequences
                 }
                 if not gene_embed_cache:
-                    self.logger.warning("Skipping gene with empty sequences: %s", gene)
+                    self.logger.warning("build_gene_feature_matrix: skipping gene with empty sequences gene=%s", gene)
                     continue
                 embed_block = np.vstack([gene_embed_cache[seq] for seq in seqs]).astype(np.float32, copy=False)
                 reduced, cols = self._fit_pca_block(embed_block, gene)
@@ -605,9 +730,18 @@ class VariantFeatureBuilder:
                 del embed_block
                 del reduced
                 gc.collect()
+                if hasattr(gene_iter, "set_postfix_str"):
+                    gene_iter.set_postfix_str(self._memory_str())
+                if idx % 50 == 0 or idx == gene_count:
+                    self._log_memory(
+                        "build_gene_feature_matrix: gene embedding progress genes=%d/%d feature_cols=%d",
+                        idx,
+                        gene_count,
+                        total_feature_cols,
+                    )
 
             self.logger.info(
-                "Embedding completed: total=%d cache_hits=%d cache_misses=%d cache_hit_rate=%.2f%% output_feature_cols=%d",
+                "build_gene_feature_matrix: embedding completed total=%d cache_hits=%d cache_misses=%d cache_hit_rate=%.2f%% output_feature_cols=%d",
                 self._embed_total,
                 self._embed_cache_hits,
                 self._embed_cache_misses,
@@ -623,48 +757,70 @@ class VariantFeatureBuilder:
             )
             columns: list[str] = []
             offset = 0
-            for block_path, cols in self._progress(
+            block_iter = self._progress(
                 block_meta,
                 total=len(block_meta),
                 desc="Assembling feature matrix",
                 unit="block",
-            ):
+            )
+            for idx, (block_path, cols) in enumerate(block_iter, start=1):
                 block = np.load(block_path)
                 width = block.shape[1]
                 matrix[:, offset:offset + width] = block
                 columns.extend(cols)
                 offset += width
                 del block
+                if hasattr(block_iter, "set_postfix_str"):
+                    block_iter.set_postfix_str(self._memory_str())
+                if idx % 50 == 0 or idx == len(block_meta):
+                    self._log_memory(
+                        "build_gene_feature_matrix: feature matrix assembly progress blocks=%d/%d",
+                        idx,
+                        len(block_meta),
+                    )
             matrix.flush()
-            out_df = pd.DataFrame(np.asarray(matrix), columns=columns)
-        out_df.insert(0, "sample", sample_list)
-        csv_path, parquet_path = self._save_matrix_dual(out_df, self.outdir / "gene_feature_matrix")
+            csv_path, parquet_path = self._write_chunked_dual_matrix(
+                matrix=matrix,
+                sample_list=sample_list,
+                columns=columns,
+                path_without_suffix=self.outdir / "gene_feature_matrix",
+            )
+            del matrix
+            del block_meta
+            gc.collect()
         self.logger.info(
-            "Saved gene_feature_matrix: csv=%s parquet=%s shape=%s",
+            "build_gene_feature_matrix: saved gene_feature_matrix csv=%s parquet=%s shape=%s",
             csv_path,
             parquet_path,
-            out_df.shape,
+            (len(sample_list), len(columns) + 1),
         )
-        return out_df
+        self._log_memory("build_gene_feature_matrix: saved shape=%s", (len(sample_list), len(columns) + 1))
+        meta = {
+            "shape": (len(sample_list), len(columns) + 1),
+            "csv_path": str(csv_path),
+            "parquet_path": str(parquet_path),
+        }
+        gc.collect()
+        return meta
 
-    def run(self) -> Dict[str, pd.DataFrame]:
+    def run(self) -> Dict[str, dict[str, object]]:
         self._load_site_df()
         self._build_geno_df()
         self.site_df_loaded = None
         self.site_df = None
         gc.collect()
-        genotype_012 = self.build_genotype_012()
+        self._log_memory("run: released site_df intermediates")
+        outputs: Dict[str, dict[str, object]] = {}
+        outputs["genotype_012"] = self.build_genotype_012()
         gc.collect()
-        gene_feature_matrix = self.build_gene_feature_matrix()
+        self._log_memory("run: post genotype_012 save")
+        outputs["gene_feature_matrix"] = self.build_gene_feature_matrix()
         gc.collect()
         self.geno_df = None
         gc.collect()
-        gc.collect()
-        self.logger.info("VariantFeatureBuilder finished")
-        return {
-            "genotype_012": genotype_012,
-            "gene_feature_matrix": gene_feature_matrix,
-        }
+        self._log_memory("run: released geno_df after gene feature matrix build")
+        self.logger.info("run: VariantFeatureBuilder finished")
+        return outputs
 
 
 def _parse_embedder_kwargs(raw: str | None) -> dict:
@@ -716,7 +872,7 @@ def main() -> None:
         pca_var_threshold=args.pca_var_threshold,
         gene_feature_format=args.gene_feature_format,
     ).run()
-    print({name: df.shape for name, df in outputs.items() if isinstance(df, pd.DataFrame)})
+    print({name: meta.get("shape") for name, meta in outputs.items()})
 
 
 if __name__ == "__main__":
