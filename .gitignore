@@ -229,3 +229,16 @@ test_inputs/
 *.sh
 *.parquet
 .idea/
+
+*.tsv
+*.joblib
+*.log
+*.txt
+*.vcf.gz
+*.gz
+*.xml
+*.npy
+*.ipynb
+*.so
+*.tbi
+*.csi

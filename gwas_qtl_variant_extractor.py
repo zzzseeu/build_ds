@@ -14,7 +14,7 @@ from typing import Dict, List, Set, Tuple
 
 import pandas as pd
 
-from logging import init_logger
+from logger import init_logger
 from utils import (
     extract_gff3_feature_interval_trees,
     extract_gff3_feature_interval_trees_gffutils,
