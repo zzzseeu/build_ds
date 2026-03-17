@@ -96,6 +96,7 @@ class VariantFeatureBuilder:
 
         self.site_df_loaded: pd.DataFrame | None = None
         self.geno_df: pd.DataFrame | None = None
+        self.genotype_012_meta: dict[str, object] | None = None
         self.sample_columns: list[str] = []
         self.embed_log_every = 500
         self._embed_total = 0
@@ -306,23 +307,29 @@ class VariantFeatureBuilder:
         self.site_df_loaded = df
         return df
 
-    def _build_geno_df(self) -> pd.DataFrame:
-        try:
-            import pysam  # type: ignore
-        except Exception as exc:
-            raise ImportError("pysam is required to read VCF/FASTA") from exc
+    def _load_or_get_site_df(self) -> pd.DataFrame:
+        return self.site_df_loaded if self.site_df_loaded is not None else self._load_site_df()
 
-        site_df = self.site_df_loaded if self.site_df_loaded is not None else self._load_site_df()
-        target_sites = {
+    @staticmethod
+    def _collect_target_sites(site_df: pd.DataFrame) -> set[tuple[str, int]]:
+        return {
             (str(chrom), int(pos))
             for chrom, pos in site_df[["Chromosome", "Position"]].drop_duplicates().itertuples(index=False, name=None)
         }
 
-        vcf = pysam.VariantFile(str(self.vcf_path))
+    def _load_vcf_sample_metadata(self, vcf) -> tuple[list[str], dict[str, str]]:
         raw_samples = list(vcf.header.samples)
         sample_map = self._standardize_sample_names(raw_samples)
         self.sample_columns = [sample_map[s] for s in raw_samples]
+        return raw_samples, sample_map
 
+    def _scan_vcf_genotype_map(
+        self,
+        vcf,
+        target_sites: set[tuple[str, int]],
+        raw_samples: list[str],
+        sample_map: dict[str, str],
+    ) -> dict[tuple[str, int], dict[str, str | int]]:
         genotype_map: dict[tuple[str, int], dict[str, str | int]] = {}
         vcf_iter = self._progress(vcf, desc="Scanning VCF records", unit="record")
         for idx, rec in enumerate(vcf_iter, start=1):
@@ -347,11 +354,17 @@ class VariantFeatureBuilder:
                 if hasattr(vcf_iter, "set_postfix_str"):
                     vcf_iter.set_postfix_str(self._memory_str())
                 self._log_memory(
-                    "_build_geno_df: VCF scan progress scanned=%d matched_sites=%d",
+                    "_scan_vcf_genotype_map: progress scanned=%d matched_sites=%d",
                     idx,
                     len(genotype_map),
                 )
+        return genotype_map
 
+    def _build_geno_rows(
+        self,
+        site_df: pd.DataFrame,
+        genotype_map: dict[tuple[str, int], dict[str, str | int]],
+    ) -> list[dict[str, str | int]]:
         rows: list[dict[str, str | int]] = []
         row_iter = self._progress(
             site_df.itertuples(index=False),
@@ -378,8 +391,46 @@ class VariantFeatureBuilder:
             if idx % 100000 == 0:
                 if hasattr(row_iter, "set_postfix_str"):
                     row_iter.set_postfix_str(self._memory_str())
-                self._log_memory("_build_geno_df: geno_df row build progress rows=%d", idx)
+                self._log_memory("_build_geno_rows: progress rows=%d", idx)
+        return rows
 
+    def _save_genotype_012_from_geno_df(self, geno_df: pd.DataFrame) -> dict[str, object]:
+        site_df = geno_df.drop_duplicates(subset=["Chromosome", "Position"]).reset_index(drop=True)
+        feature_names = [f"{chrom}:{pos}" for chrom, pos in site_df[["Chromosome", "Position"]].itertuples(index=False, name=None)]
+        matrix = site_df[self.sample_columns].to_numpy(dtype=np.int8).T
+        out_df = pd.DataFrame(matrix, columns=feature_names)
+        out_df.insert(0, "sample", self.sample_columns)
+        csv_path, parquet_path = self._save_matrix_dual(out_df, self.outdir / "genotype_012")
+        self.logger.info(
+            "_save_genotype_012_from_geno_df: saved genotype_012 csv=%s parquet=%s shape=%s",
+            csv_path,
+            parquet_path,
+            out_df.shape,
+        )
+        self._log_memory("_save_genotype_012_from_geno_df: saved shape=%s", out_df.shape)
+        meta = {
+            "shape": tuple(out_df.shape),
+            "csv_path": str(csv_path),
+            "parquet_path": str(parquet_path),
+        }
+        del out_df
+        del matrix
+        del site_df
+        gc.collect()
+        return meta
+
+    def _build_geno_df(self) -> pd.DataFrame:
+        try:
+            import pysam  # type: ignore
+        except Exception as exc:
+            raise ImportError("pysam is required to read VCF/FASTA") from exc
+
+        site_df = self._load_or_get_site_df()
+        target_sites = self._collect_target_sites(site_df)
+        vcf = pysam.VariantFile(str(self.vcf_path))
+        raw_samples, sample_map = self._load_vcf_sample_metadata(vcf)
+        genotype_map = self._scan_vcf_genotype_map(vcf, target_sites, raw_samples, sample_map)
+        rows = self._build_geno_rows(site_df, genotype_map)
         geno_df = pd.DataFrame(rows, columns=self.GENO_META_COLUMNS + self.sample_columns)
         del rows
         del genotype_map
@@ -391,6 +442,7 @@ class VariantFeatureBuilder:
         geno_path = self.outdir / "geno_df.csv"
         geno_df.to_csv(geno_path, index=False)
         self.logger.info("_build_geno_df: saved geno_df path=%s shape=%s", geno_path, geno_df.shape)
+        self.genotype_012_meta = self._save_genotype_012_from_geno_df(geno_df)
         return geno_df
 
     def _deduplicate_geno_df(self, geno_df: pd.DataFrame) -> pd.DataFrame:
@@ -477,31 +529,16 @@ class VariantFeatureBuilder:
             raise KeyError(f"Chromosome {chrom} not found in FASTA")
         return chrom_map[chrom]
 
-    def build_genotype_012(self) -> dict[str, object]:
+    def _iter_gene_groups(self):
         assert self.geno_df is not None
-        site_df = self.geno_df.drop_duplicates(subset=["Chromosome", "Position"]).reset_index(drop=True)
-        feature_names = [f"{chrom}:{pos}" for chrom, pos in site_df[["Chromosome", "Position"]].itertuples(index=False, name=None)]
-        matrix = site_df[self.sample_columns].to_numpy(dtype=np.int8).T
-        out_df = pd.DataFrame(matrix, columns=feature_names)
-        out_df.insert(0, "sample", self.sample_columns)
-        csv_path, parquet_path = self._save_matrix_dual(out_df, self.outdir / "genotype_012")
-        self.logger.info(
-            "build_genotype_012: saved genotype_012 csv=%s parquet=%s shape=%s",
-            csv_path,
-            parquet_path,
-            out_df.shape,
-        )
-        self._log_memory("build_genotype_012: saved shape=%s", out_df.shape)
-        meta = {
-            "shape": tuple(out_df.shape),
-            "csv_path": str(csv_path),
-            "parquet_path": str(parquet_path),
-        }
-        del out_df
-        del matrix
-        del site_df
-        gc.collect()
-        return meta
+        return self.geno_df.groupby("Gene", sort=True)
+
+    def build_genotype_012(self) -> dict[str, object]:
+        if self.genotype_012_meta is not None:
+            return dict(self.genotype_012_meta)
+        assert self.geno_df is not None
+        self.genotype_012_meta = self._save_genotype_012_from_geno_df(self.geno_df)
+        return dict(self.genotype_012_meta)
 
     def _validate_variant_ref_in_gene_seq(
         self,
@@ -604,6 +641,110 @@ class VariantFeatureBuilder:
             for sample in self.sample_columns
         ]
 
+    def _embed_gene_sequences(self, seqs: list[str]) -> np.ndarray:
+        unique_gene_sequences = sorted({seq for seq in seqs if seq})
+        gene_embed_cache = {
+            seq: self._load_cached_embedding(seq).astype(np.float32)
+            for seq in unique_gene_sequences
+        }
+        if not gene_embed_cache:
+            return np.empty((0, 0), dtype=np.float32)
+        embed_block = np.vstack([gene_embed_cache[seq] for seq in seqs]).astype(np.float32, copy=False)
+        del unique_gene_sequences
+        del gene_embed_cache
+        return embed_block
+
+    def _build_gene_feature_blocks(
+        self,
+        sample_list: list[str],
+        fasta,
+        chrom_map: dict[str, str],
+        tempdir: Path,
+    ) -> tuple[list[tuple[Path, list[str]]], int]:
+        block_meta: list[tuple[Path, list[str]]] = []
+        total_feature_cols = 0
+        gene_count = int(self.geno_df["Gene"].nunique()) if self.geno_df is not None else 0
+        gene_iter = self._progress(
+            self._iter_gene_groups(),
+            desc="Projecting gene embeddings",
+            total=gene_count,
+            unit="gene",
+        )
+        for idx, (gene, gene_df) in enumerate(gene_iter, start=1):
+            seqs = self._build_sample_gene_sequences(str(gene), gene_df, fasta, chrom_map)
+            embed_block = self._embed_gene_sequences(seqs)
+            if embed_block.size == 0:
+                self.logger.warning("build_gene_feature_matrix: skipping gene with empty sequences gene=%s", gene)
+                continue
+            reduced, cols = self._fit_pca_block(embed_block, str(gene))
+            block_path = tempdir / f"{gene}.npy"
+            np.save(block_path, reduced.astype(np.float32, copy=False))
+            block_meta.append((block_path, cols))
+            total_feature_cols += len(cols)
+            del seqs
+            del embed_block
+            del reduced
+            gc.collect()
+            if hasattr(gene_iter, "set_postfix_str"):
+                gene_iter.set_postfix_str(self._memory_str())
+            if idx % 50 == 0 or idx == gene_count:
+                self._log_memory(
+                    "build_gene_feature_matrix: gene embedding progress genes=%d/%d feature_cols=%d",
+                    idx,
+                    gene_count,
+                    total_feature_cols,
+                )
+        return block_meta, total_feature_cols
+
+    def _assemble_gene_feature_matrix(
+        self,
+        block_meta: list[tuple[Path, list[str]]],
+        sample_list: list[str],
+        total_feature_cols: int,
+        tempdir: Path,
+    ) -> tuple[Path, Path, tuple[int, int]]:
+        memmap_path = tempdir / "gene_feature_matrix.dat"
+        matrix = np.memmap(
+            memmap_path,
+            dtype=np.float32,
+            mode="w+",
+            shape=(len(sample_list), total_feature_cols),
+        )
+        columns: list[str] = []
+        offset = 0
+        block_iter = self._progress(
+            block_meta,
+            total=len(block_meta),
+            desc="Assembling feature matrix",
+            unit="block",
+        )
+        for idx, (block_path, cols) in enumerate(block_iter, start=1):
+            block = np.load(block_path)
+            width = block.shape[1]
+            matrix[:, offset:offset + width] = block
+            columns.extend(cols)
+            offset += width
+            del block
+            if hasattr(block_iter, "set_postfix_str"):
+                block_iter.set_postfix_str(self._memory_str())
+            if idx % 50 == 0 or idx == len(block_meta):
+                self._log_memory(
+                    "build_gene_feature_matrix: feature matrix assembly progress blocks=%d/%d",
+                    idx,
+                    len(block_meta),
+                )
+        matrix.flush()
+        csv_path, parquet_path = self._write_chunked_dual_matrix(
+            matrix=matrix,
+            sample_list=sample_list,
+            columns=columns,
+            path_without_suffix=self.outdir / "gene_feature_matrix",
+        )
+        shape = (len(sample_list), len(columns) + 1)
+        del matrix
+        gc.collect()
+        return csv_path, parquet_path, shape
+
     @staticmethod
     def _to_numpy_1d(x) -> np.ndarray:
         try:
@@ -688,7 +829,6 @@ class VariantFeatureBuilder:
         sample_list = list(self.sample_columns)
         fasta = self._get_fasta()
         chrom_map = self._build_fasta_chrom_map(fasta)
-        grouped = self.geno_df.groupby("Gene", sort=True)
         gene_count = int(self.geno_df["Gene"].nunique())
         self.logger.info(
             "build_gene_feature_matrix: building matrix samples=%d genes=%d embedder_type=%s model=%s use_pca=%s",
@@ -698,48 +838,14 @@ class VariantFeatureBuilder:
             self.model_name_or_path,
             self.use_pca,
         )
-        block_meta: list[tuple[Path, list[str]]] = []
-        total_feature_cols = 0
         with tempfile.TemporaryDirectory(dir=self.outdir, prefix="gene_feature_blocks_") as tempdir_name:
             tempdir = Path(tempdir_name)
-            gene_iter = self._progress(
-                grouped,
-                desc="Projecting gene embeddings",
-                total=gene_count,
-                unit="gene",
+            block_meta, total_feature_cols = self._build_gene_feature_blocks(
+                sample_list=sample_list,
+                fasta=fasta,
+                chrom_map=chrom_map,
+                tempdir=tempdir,
             )
-            for idx, (gene, gene_df) in enumerate(gene_iter, start=1):
-                seqs = self._build_sample_gene_sequences(str(gene), gene_df, fasta, chrom_map)
-                unique_gene_sequences = sorted({seq for seq in seqs if seq})
-                gene_embed_cache = {
-                    seq: self._load_cached_embedding(seq).astype(np.float32)
-                    for seq in unique_gene_sequences
-                }
-                if not gene_embed_cache:
-                    self.logger.warning("build_gene_feature_matrix: skipping gene with empty sequences gene=%s", gene)
-                    continue
-                embed_block = np.vstack([gene_embed_cache[seq] for seq in seqs]).astype(np.float32, copy=False)
-                reduced, cols = self._fit_pca_block(embed_block, gene)
-                block_path = tempdir / f"{gene}.npy"
-                np.save(block_path, reduced.astype(np.float32, copy=False))
-                block_meta.append((block_path, cols))
-                total_feature_cols += len(cols)
-                del seqs
-                del unique_gene_sequences
-                del gene_embed_cache
-                del embed_block
-                del reduced
-                gc.collect()
-                if hasattr(gene_iter, "set_postfix_str"):
-                    gene_iter.set_postfix_str(self._memory_str())
-                if idx % 50 == 0 or idx == gene_count:
-                    self._log_memory(
-                        "build_gene_feature_matrix: gene embedding progress genes=%d/%d feature_cols=%d",
-                        idx,
-                        gene_count,
-                        total_feature_cols,
-                    )
-
             self.logger.info(
                 "build_gene_feature_matrix: embedding completed total=%d cache_hits=%d cache_misses=%d cache_hit_rate=%.2f%% output_feature_cols=%d",
                 self._embed_total,
@@ -748,77 +854,53 @@ class VariantFeatureBuilder:
                 100.0 * self._embed_cache_hits / self._embed_total if self._embed_total else 0.0,
                 total_feature_cols,
             )
-            memmap_path = tempdir / "gene_feature_matrix.dat"
-            matrix = np.memmap(
-                memmap_path,
-                dtype=np.float32,
-                mode="w+",
-                shape=(len(sample_list), total_feature_cols),
-            )
-            columns: list[str] = []
-            offset = 0
-            block_iter = self._progress(
-                block_meta,
-                total=len(block_meta),
-                desc="Assembling feature matrix",
-                unit="block",
-            )
-            for idx, (block_path, cols) in enumerate(block_iter, start=1):
-                block = np.load(block_path)
-                width = block.shape[1]
-                matrix[:, offset:offset + width] = block
-                columns.extend(cols)
-                offset += width
-                del block
-                if hasattr(block_iter, "set_postfix_str"):
-                    block_iter.set_postfix_str(self._memory_str())
-                if idx % 50 == 0 or idx == len(block_meta):
-                    self._log_memory(
-                        "build_gene_feature_matrix: feature matrix assembly progress blocks=%d/%d",
-                        idx,
-                        len(block_meta),
-                    )
-            matrix.flush()
-            csv_path, parquet_path = self._write_chunked_dual_matrix(
-                matrix=matrix,
+            csv_path, parquet_path, shape = self._assemble_gene_feature_matrix(
+                block_meta=block_meta,
                 sample_list=sample_list,
-                columns=columns,
-                path_without_suffix=self.outdir / "gene_feature_matrix",
+                total_feature_cols=total_feature_cols,
+                tempdir=tempdir,
             )
-            del matrix
             del block_meta
             gc.collect()
         self.logger.info(
             "build_gene_feature_matrix: saved gene_feature_matrix csv=%s parquet=%s shape=%s",
             csv_path,
             parquet_path,
-            (len(sample_list), len(columns) + 1),
+            shape,
         )
-        self._log_memory("build_gene_feature_matrix: saved shape=%s", (len(sample_list), len(columns) + 1))
+        self._log_memory("build_gene_feature_matrix: saved shape=%s", shape)
         meta = {
-            "shape": (len(sample_list), len(columns) + 1),
+            "shape": shape,
             "csv_path": str(csv_path),
             "parquet_path": str(parquet_path),
         }
         gc.collect()
         return meta
 
-    def run(self) -> Dict[str, dict[str, object]]:
-        self._load_site_df()
-        self._build_geno_df()
+    def _cleanup_after_genotype_stage(self) -> None:
         self.site_df_loaded = None
         self.site_df = None
         gc.collect()
         self._log_memory("run: released site_df intermediates")
+
+    def _cleanup_after_feature_stage(self) -> None:
+        self.geno_df = None
+        gc.collect()
+        self._log_memory("run: released geno_df after gene feature matrix build")
+
+    def run(self) -> Dict[str, dict[str, object]]:
+        self.genotype_012_meta = None
+        self._load_or_get_site_df()
+        self._build_geno_df()
+        self._cleanup_after_genotype_stage()
         outputs: Dict[str, dict[str, object]] = {}
-        outputs["genotype_012"] = self.build_genotype_012()
+        assert self.genotype_012_meta is not None
+        outputs["genotype_012"] = dict(self.genotype_012_meta)
         gc.collect()
         self._log_memory("run: post genotype_012 save")
         outputs["gene_feature_matrix"] = self.build_gene_feature_matrix()
         gc.collect()
-        self.geno_df = None
-        gc.collect()
-        self._log_memory("run: released geno_df after gene feature matrix build")
+        self._cleanup_after_feature_stage()
         self.logger.info("run: VariantFeatureBuilder finished")
         return outputs
 
