@@ -7,8 +7,10 @@ All genomic coordinates are interpreted as 1-based.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -258,6 +260,8 @@ class VariantFeatureBuilder:
 
         geno_df = pd.DataFrame(rows, columns=self.GENO_META_COLUMNS + self.sample_columns)
         geno_df = self._deduplicate_geno_df(geno_df)
+        if self.sample_columns:
+            geno_df[self.sample_columns] = geno_df[self.sample_columns].astype(np.int8)
         self.geno_df = geno_df
         geno_path = self.outdir / "geno_df.csv"
         geno_df.to_csv(geno_path, index=False)
@@ -338,33 +342,6 @@ class VariantFeatureBuilder:
             raise KeyError(f"Chromosome {chrom} not found in FASTA")
         return chrom_map[chrom]
 
-    def _validate_ref_against_fasta(self) -> None:
-        assert self.geno_df is not None
-        fasta = self._get_fasta()
-        chrom_map = self._build_fasta_chrom_map(fasta)
-        checked = 0
-        mismatched = 0
-
-        uniq = self.geno_df[["Chromosome", "Position", "REF"]].drop_duplicates()
-        for row in uniq.itertuples(index=False):
-            ref = str(row.REF)
-            if not ref:
-                continue
-            fasta_chrom = self._resolve_fasta_chrom(str(row.Chromosome), chrom_map)
-            observed = fasta.fetch(fasta_chrom, int(row.Position) - 1, int(row.Position) - 1 + len(ref))
-            checked += 1
-            if observed.upper() != ref.upper():
-                mismatched += 1
-                self.logger.warning(
-                    "REF mismatch at %s:%d expected=%s observed=%s",
-                    str(row.Chromosome),
-                    int(row.Position),
-                    ref,
-                    observed,
-                )
-
-        self.logger.info("REF validation finished: checked=%d mismatched=%d", checked, mismatched)
-
     def build_genotype_012(self) -> pd.DataFrame:
         assert self.geno_df is not None
         site_df = self.geno_df.drop_duplicates(subset=["Chromosome", "Position"]).reset_index(drop=True)
@@ -376,29 +353,6 @@ class VariantFeatureBuilder:
         out_df.to_csv(out_path, index=False)
         self.logger.info("Saved genotype_012: %s shape=%s", out_path, out_df.shape)
         return out_df
-
-    def _build_ref_gene_seq_dict(self) -> dict[str, str]:
-        assert self.geno_df is not None
-        fasta = self._get_fasta()
-        chrom_map = self._build_fasta_chrom_map(fasta)
-        ref_gene_seq_dict: dict[str, str] = {}
-
-        gene_meta = self.geno_df[["Gene", "Chromosome", "gene_start", "gene_end"]].drop_duplicates()
-        for row in gene_meta.itertuples(index=False):
-            fasta_chrom = self._resolve_fasta_chrom(str(row.Chromosome), chrom_map)
-            ref_gene_seq_dict[str(row.Gene)] = fasta.fetch(fasta_chrom, int(row.gene_start) - 1, int(row.gene_end))
-
-        self._save_json(ref_gene_seq_dict, self.dict_dir / "ref_gene_seq_dict.json")
-        self.logger.info("Built ref_gene_seq_dict: genes=%d", len(ref_gene_seq_dict))
-        return ref_gene_seq_dict
-
-    def _append_gene_seq_column(self, ref_gene_seq_dict: dict[str, str]) -> None:
-        assert self.geno_df is not None
-        self.geno_df = self.geno_df.copy()
-        self.geno_df["gene_seq"] = self.geno_df["Gene"].map(ref_gene_seq_dict)
-        out_path = self.outdir / "geno_df_with_gene_seq.csv"
-        self.geno_df.to_csv(out_path, index=False)
-        self.logger.info("Saved geno_df_with_gene_seq: %s shape=%s", out_path, self.geno_df.shape)
 
     def _validate_variant_ref_in_gene_seq(
         self,
@@ -474,42 +428,39 @@ class VariantFeatureBuilder:
 
     def build_gene_sequence_matrix(self) -> pd.DataFrame:
         assert self.geno_df is not None
-        ref_gene_seq_dict = self._build_ref_gene_seq_dict()
-        self._append_gene_seq_column(ref_gene_seq_dict)
-        gene_seq_dict: dict[str, dict[str, str]] = {sample: {} for sample in self.sample_columns}
-        grouped_items = list(self.geno_df.groupby("Gene", sort=True))
+        fasta = self._get_fasta()
+        chrom_map = self._build_fasta_chrom_map(fasta)
+        grouped = self.geno_df.groupby("Gene", sort=True)
+        gene_count = int(self.geno_df["Gene"].nunique())
         self.logger.info(
             "Building gene sequences: genes=%d samples=%d",
-            len(grouped_items),
+            gene_count,
             len(self.sample_columns),
         )
-
+        data: dict[str, list[str]] = {"sample": list(self.sample_columns)}
         for gene, gene_df in self._progress(
-            grouped_items,
+            grouped,
             desc="Building gene sequences",
-            total=len(grouped_items),
+            total=gene_count,
             unit="gene",
         ):
             gene_df = gene_df.sort_values(["Position"]).reset_index(drop=True)
             gene_start = int(gene_df["gene_start"].iloc[0])
-            reference_seq = ref_gene_seq_dict[str(gene)]
+            fasta_chrom = self._resolve_fasta_chrom(str(gene_df["Chromosome"].iloc[0]), chrom_map)
+            reference_seq = fasta.fetch(fasta_chrom, gene_start - 1, int(gene_df["gene_end"].iloc[0]))
             variant_rows = [row._asdict() for row in gene_df.itertuples(index=False)]
-            for sample in self.sample_columns:
-                gene_seq_dict[sample][str(gene)] = self._apply_variants_to_gene(
+            data[str(gene)] = [
+                self._apply_variants_to_gene(
                     reference_seq=reference_seq,
                     gene_start=gene_start,
                     variant_rows=variant_rows,
                     sample=sample,
                 )
-
-        gene_names = sorted(ref_gene_seq_dict)
-        out_df = pd.DataFrame(
-            [{"sample": sample, **{gene: gene_seq_dict[sample].get(gene, "") for gene in gene_names}} for sample in self.sample_columns],
-            columns=["sample"] + gene_names,
-        )
+                for sample in self.sample_columns
+            ]
+        out_df = pd.DataFrame(data)
         out_path = self.outdir / "gene_sequence_matrix.csv"
         out_df.to_csv(out_path, index=False)
-        self._save_json(gene_seq_dict, self.dict_dir / "gene_sequence_dict.json")
         self.logger.info("Saved gene_sequence_matrix: %s shape=%s", out_path, out_df.shape)
         return out_df
 
@@ -551,6 +502,13 @@ class VariantFeatureBuilder:
             )
         return vec
 
+    def _load_cached_embedding(self, seq: str) -> np.ndarray:
+        seq_hash = hashlib.sha1(seq.encode("utf-8")).hexdigest()
+        cache_path = self.cache_dir / f"{seq_hash}.npy"
+        if not cache_path.exists():
+            return self._embed_sequence(seq)
+        return np.load(cache_path)
+
     def _fit_pca_block(self, block: np.ndarray, gene: str) -> tuple[np.ndarray, list[str]]:
         if not self.use_pca:
             return block.astype(np.float32), [f"{gene}-embed-{i}" for i in range(block.shape[1])]
@@ -583,74 +541,91 @@ class VariantFeatureBuilder:
 
     def build_gene_feature_matrix(self, gene_sequence_df: pd.DataFrame) -> pd.DataFrame:
         self._ensure_embedder()
-        seq_values = gene_sequence_df.iloc[:, 1:].to_numpy().ravel()
-        unique_sequences = sorted({str(seq) for seq in seq_values if str(seq) != ""})
         self._embed_total = 0
         self._embed_cache_hits = 0
         self._embed_cache_misses = 0
+        sample_list = gene_sequence_df["sample"].tolist()
+        gene_columns = gene_sequence_df.columns[1:].tolist()
         self.logger.info(
-            "Building gene feature matrix: samples=%d genes=%d unique_sequences=%d embedder_type=%s model=%s use_pca=%s",
+            "Building gene feature matrix: samples=%d genes=%d embedder_type=%s model=%s use_pca=%s",
             len(gene_sequence_df),
-            max(0, gene_sequence_df.shape[1] - 1),
-            len(unique_sequences),
+            len(gene_columns),
             self.embedder_type,
             self.model_name_or_path,
             self.use_pca,
         )
-        seq_embed_dict: dict[str, list[float]] = {}
-        for seq in self._progress(
-            unique_sequences,
-            desc="Embedding unique gene sequences",
-            total=len(unique_sequences),
-            unit="seq",
-        ):
-            seq_embed_dict[seq] = self._embed_sequence(seq).tolist()
-        self._save_json(seq_embed_dict, self.dict_dir / "unique_gene_sequence_embedding_dict.json")
-        self.logger.info(
-            "Embedding completed: total=%d cache_hits=%d cache_misses=%d cache_hit_rate=%.2f%%",
-            self._embed_total,
-            self._embed_cache_hits,
-            self._embed_cache_misses,
-            100.0 * self._embed_cache_hits / self._embed_total if self._embed_total else 0.0,
-        )
+        block_meta: list[tuple[Path, list[str]]] = []
+        total_feature_cols = 0
+        with tempfile.TemporaryDirectory(dir=self.outdir, prefix="gene_feature_blocks_") as tempdir_name:
+            tempdir = Path(tempdir_name)
+            for gene in self._progress(
+                gene_columns,
+                desc="Projecting gene embeddings",
+                total=len(gene_columns),
+                unit="gene",
+            ):
+                seqs = gene_sequence_df[gene].astype(str).tolist()
+                unique_gene_sequences = sorted({seq for seq in seqs if seq})
+                gene_embed_cache = {
+                    seq: self._load_cached_embedding(seq).astype(np.float32)
+                    for seq in unique_gene_sequences
+                }
+                if not gene_embed_cache:
+                    self.logger.warning("Skipping gene with empty sequences: %s", gene)
+                    continue
+                embed_block = np.vstack([gene_embed_cache[seq] for seq in seqs]).astype(np.float32, copy=False)
+                reduced, cols = self._fit_pca_block(embed_block, gene)
+                block_path = tempdir / f"{gene}.npy"
+                np.save(block_path, reduced.astype(np.float32, copy=False))
+                block_meta.append((block_path, cols))
+                total_feature_cols += len(cols)
+                del gene_embed_cache
+                del embed_block
+                del reduced
 
-        blocks: list[np.ndarray] = []
-        columns = ["sample"]
-        gene_feature_dict: dict[str, dict[str, list[float] | float]] = {sample: {} for sample in gene_sequence_df["sample"].tolist()}
-
-        gene_columns = gene_sequence_df.columns[1:].tolist()
-        for gene in self._progress(
-            gene_columns,
-            desc="Projecting gene embeddings",
-            total=len(gene_columns),
-            unit="gene",
-        ):
-            seqs = gene_sequence_df[gene].astype(str).tolist()
-            embed_block = np.vstack([np.asarray(seq_embed_dict[seq], dtype=np.float32) for seq in seqs])
-            for sample, vec in zip(gene_sequence_df["sample"].tolist(), embed_block):
-                gene_feature_dict[sample][gene] = vec.astype(np.float32).tolist()
-            reduced, cols = self._fit_pca_block(embed_block, gene)
-            for sample_idx, sample in enumerate(gene_sequence_df["sample"].tolist()):
-                for col_idx, col in enumerate(cols):
-                    gene_feature_dict[sample][col] = float(reduced[sample_idx, col_idx])
-            blocks.append(reduced)
-            columns.extend(cols)
-
-        matrix = np.concatenate(blocks, axis=1) if blocks else np.empty((len(gene_sequence_df), 0), dtype=np.float32)
-        out_df = pd.DataFrame(matrix, columns=columns[1:])
+            self.logger.info(
+                "Embedding completed: total=%d cache_hits=%d cache_misses=%d cache_hit_rate=%.2f%% output_feature_cols=%d",
+                self._embed_total,
+                self._embed_cache_hits,
+                self._embed_cache_misses,
+                100.0 * self._embed_cache_hits / self._embed_total if self._embed_total else 0.0,
+                total_feature_cols,
+            )
+            memmap_path = tempdir / "gene_feature_matrix.dat"
+            matrix = np.memmap(
+                memmap_path,
+                dtype=np.float32,
+                mode="w+",
+                shape=(len(sample_list), total_feature_cols),
+            )
+            columns: list[str] = []
+            offset = 0
+            for block_path, cols in block_meta:
+                block = np.load(block_path)
+                width = block.shape[1]
+                matrix[:, offset:offset + width] = block
+                columns.extend(cols)
+                offset += width
+                del block
+            matrix.flush()
+            out_df = pd.DataFrame(np.asarray(matrix), columns=columns)
         out_df.insert(0, "sample", gene_sequence_df["sample"].tolist())
         out_path = self._save_matrix(out_df, self.outdir / "gene_feature_matrix", self.gene_feature_format)
-        self._save_json(gene_feature_dict, self.dict_dir / "gene_feature_embedding_dict.json")
         self.logger.info("Saved gene_feature_matrix: %s shape=%s", out_path, out_df.shape)
         return out_df
 
     def run(self) -> Dict[str, pd.DataFrame]:
         self._load_site_df()
         self._build_geno_df()
-        self._validate_ref_against_fasta()
+        self.site_df_loaded = None
+        self.site_df = None
+        gc.collect()
         genotype_012 = self.build_genotype_012()
+        gc.collect()
         gene_sequence_matrix = self.build_gene_sequence_matrix()
+        gc.collect()
         gene_feature_matrix = self.build_gene_feature_matrix(gene_sequence_matrix)
+        gc.collect()
         self.logger.info("VariantFeatureBuilder finished")
         return {
             "geno_df": self.geno_df,
