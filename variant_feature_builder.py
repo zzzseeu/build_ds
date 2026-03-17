@@ -221,7 +221,7 @@ class VariantFeatureBuilder:
         self.sample_columns = [sample_map[s] for s in raw_samples]
 
         genotype_map: dict[tuple[str, int], dict[str, str | int]] = {}
-        for rec in vcf:
+        for rec in self._progress(vcf, desc="Scanning VCF records", unit="record"):
             chrom = standard_chrom(str(rec.chrom))
             if chrom is None:
                 continue
@@ -241,7 +241,12 @@ class VariantFeatureBuilder:
             genotype_map[key] = row_map
 
         rows: list[dict[str, str | int]] = []
-        for row in site_df.itertuples(index=False):
+        for row in self._progress(
+            site_df.itertuples(index=False),
+            total=len(site_df),
+            desc="Building geno_df rows",
+            unit="row",
+        ):
             key = (str(row.Chromosome), int(row.Position))
             site_gt = genotype_map.get(key, {"REF": "", "ALT": "", **{sample: 0 for sample in self.sample_columns}})
             out_row: dict[str, str | int] = {
@@ -282,10 +287,15 @@ class VariantFeatureBuilder:
             "+".join(subset),
         )
 
-        for row in (
+        dup_rows = (
             geno_df.loc[dup_mask, ["Gene", "Chromosome", "Position", "REF", "ALT"]]
             .drop_duplicates()
-            .itertuples(index=False)
+        )
+        for row in self._progress(
+            dup_rows.itertuples(index=False),
+            total=len(dup_rows),
+            desc="Checking duplicated geno_df sites",
+            unit="site",
         ):
             group = geno_df[
                 (geno_df["Gene"] == row.Gene)
@@ -449,6 +459,13 @@ class VariantFeatureBuilder:
             fasta_chrom = self._resolve_fasta_chrom(str(gene_df["Chromosome"].iloc[0]), chrom_map)
             reference_seq = fasta.fetch(fasta_chrom, gene_start - 1, int(gene_df["gene_end"].iloc[0]))
             variant_rows = [row._asdict() for row in gene_df.itertuples(index=False)]
+            active_samples = sum(bool(int(gene_df[sample].fillna(0).gt(0).any())) for sample in self.sample_columns)
+            self.logger.info(
+                "Applying gene variants: gene=%s variant_rows=%d active_samples=%d",
+                gene,
+                len(variant_rows),
+                active_samples,
+            )
             data[str(gene)] = [
                 self._apply_variants_to_gene(
                     reference_seq=reference_seq,
@@ -600,7 +617,12 @@ class VariantFeatureBuilder:
             )
             columns: list[str] = []
             offset = 0
-            for block_path, cols in block_meta:
+            for block_path, cols in self._progress(
+                block_meta,
+                total=len(block_meta),
+                desc="Assembling feature matrix",
+                unit="block",
+            ):
                 block = np.load(block_path)
                 width = block.shape[1]
                 matrix[:, offset:offset + width] = block
