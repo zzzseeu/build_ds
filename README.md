@@ -34,25 +34,24 @@
 ### 2) `variant_feature_builder.py`
 - 作用：
   - 提供单一 `VariantFeatureBuilder` 类，直接承接位点 CSV + VCF + FASTA；
-  - 依次构建 `geno_df`、`genotype_012`、`gene_sequence_matrix`、`gene_feature_matrix`；
-  - 支持 embedding 缓存、唯一序列 embedding、按基因 PCA 降维。
+  - 先构建 `geno_df` 和 `genotype_012`；
+  - 再逐基因生成样本特异序列，逐基因做 embedding 与 PCA；
+  - 最终拼接所有基因 PCA block，得到 `gene_feature_matrix`；
+  - 支持 embedding 缓存、低内存分块写出和按基因 PCA 降维。
 - 主要类：
   - `VariantFeatureBuilder`
 - 使用方式：
   - 当前模块同时提供 CLI 和 Python API；
   - 使用单个 `VariantFeatureBuilder.run()` 完成全流程；
   - CLI 也改为单条命令直接完成全流程；
-  - 若需要序列类特征，初始化 `VariantFeatureBuilder` 时必须提供 `embedder` 或 `embedder_type`；CLI 中使用 `--embedder_type + --model_name_or_path`。
+  - 若需要序列类特征，初始化 `VariantFeatureBuilder` 时必须提供 `embedder` 或 `embedder_type`；CLI 中使用 `--embedder_type + --model_name_or_path`；
+  - `run()` 返回的是输出文件路径与矩阵形状的轻量字典，不返回完整大矩阵。
 - 主要输出文件：
   - `{outdir}/geno_df.csv`
-  - `{outdir}/geno_df_with_gene_seq.csv`
   - `{outdir}/genotype_012.csv`
-  - `{outdir}/gene_sequence_matrix.csv`
-  - `{outdir}/gene_feature_matrix.csv` 或 `{outdir}/gene_feature_matrix.parquet`
-  - `{outdir}/dicts/ref_gene_seq_dict.json`
-  - `{outdir}/dicts/gene_sequence_dict.json`
-  - `{outdir}/dicts/unique_gene_sequence_embedding_dict.json`
-  - `{outdir}/dicts/gene_feature_embedding_dict.json`
+  - `{outdir}/genotype_012.parquet`
+  - `{outdir}/gene_feature_matrix.csv`
+  - `{outdir}/gene_feature_matrix.parquet`
   - `{outdir}/pca_models/`（当 `use_pca=True`）
   - `{outdir}/embedding_cache/`
 
@@ -155,16 +154,19 @@ conda run -n py-bioinfo python /path/to/project/variant_feature_builder.py \
 ```
 
 说明：
-- 该命令会一次性生成 `geno_df`、`genotype_012`、`gene_sequence_matrix`、`gene_feature_matrix`
+- 该命令会一次性生成 `geno_df`、`genotype_012` 和 `gene_feature_matrix`
+- `gene_feature_matrix` 的构建逻辑是：逐基因生成样本特异序列，逐基因做 embedding，逐基因做 PCA，再拼接所有基因的 PCA block
 - `--embedder_kwargs` 需要传 JSON 对象字符串
-- `--gene_feature_format` 可选 `csv` 或 `parquet`
 - 如模型已经在本地，保留默认 `--local_files_only` 即可；若允许远程拉取，可添加 `--no-local_files_only`
 
 输出示例文件：
 - `/path/to/project/test_outputs/feature_demo_cli/geno_df.csv`
 - `/path/to/project/test_outputs/feature_demo_cli/genotype_012.csv`
-- `/path/to/project/test_outputs/feature_demo_cli/gene_sequence_matrix.csv`
+- `/path/to/project/test_outputs/feature_demo_cli/genotype_012.parquet`
 - `/path/to/project/test_outputs/feature_demo_cli/gene_feature_matrix.csv`
+- `/path/to/project/test_outputs/feature_demo_cli/gene_feature_matrix.parquet`
+- `/path/to/project/test_outputs/feature_demo_cli/pca_models/`
+- `/path/to/project/test_outputs/feature_demo_cli/embedding_cache/`
 
 ## C. 全流程构建（Python API）
 
@@ -189,28 +191,23 @@ builder = VariantFeatureBuilder(
     },
     use_pca=True,
     pca_var_threshold=0.95,
-    gene_feature_format="csv",
 )
 
 outputs = builder.run()
-print(outputs["geno_df"].shape)
-print(outputs["genotype_012"].shape)
-print(outputs["gene_sequence_matrix"].shape)
-print(outputs["gene_feature_matrix"].shape)
+print(outputs["genotype_012"]["shape"])
+print(outputs["genotype_012"]["csv_path"])
+print(outputs["gene_feature_matrix"]["shape"])
+print(outputs["gene_feature_matrix"]["parquet_path"])
 ```
 
 说明：
-- `VariantFeatureBuilder` 当前会串联构建 4 个核心结果：
-  - `geno_df`：位点 x 样本基因型矩阵，含位点元信息
+- `VariantFeatureBuilder` 当前会串联构建 3 类结果：
+  - `geno_df`：位点 x 样本基因型矩阵，含位点元信息，中间结果会保存为文件
   - `genotype_012`：行为样本，列为去重后的 `ChrN:Pos`
-  - `gene_sequence_matrix`：行为样本，列为基因变异序列
-  - `gene_feature_matrix`：行为样本，列为基因 embedding 或 PCA 特征
-- `run()` 返回一个字典，键固定为：`geno_df`、`genotype_012`、`gene_sequence_matrix`、`gene_feature_matrix`
+  - `gene_feature_matrix`：行为样本，列为逐基因 PCA 后拼接的特征
+- `run()` 返回一个轻量字典，键固定为：`genotype_012`、`gene_feature_matrix`
+- 返回值中保存的是输出文件路径与矩阵形状，不是完整 DataFrame
 - 会额外保存：
-  - `dicts/ref_gene_seq_dict.json`
-  - `dicts/gene_sequence_dict.json`
-  - `dicts/unique_gene_sequence_embedding_dict.json`
-  - `dicts/gene_feature_embedding_dict.json`
   - `pca_models/` 下的每个基因 PCA 模型文件（若 `use_pca=True`）
   - `embedding_cache/` 下按序列 SHA1 命名的 `.npy` 缓存文件
 - 如果你已经有自定义 embedding 模型，也可以直接传入 `embedder=<callable>`，其输入应为单条 DNA 序列字符串，输出应为 1D 向量或形如 `(1, D)` 的数组
@@ -243,7 +240,7 @@ outputs = VariantFeatureBuilder(
     model_name_or_path="/path/to/models/rice_1B_stage2_8k_hf",
 ).run()
 
-print(outputs["gene_feature_matrix"].head())
+print(outputs["gene_feature_matrix"]["csv_path"])
 ```
 
 ## E. `utils.py` 使用示例
@@ -310,7 +307,6 @@ print(hits)
 
 - `geno_df`：前 9 列为 `Chromosome, Position, Gene, gene_start, gene_end, REF, ALT, qtl_trait, gwas_trait`
 - `genotype_012`：`sample` + `ChrN:Pos`
-- `gene_sequence_matrix`：`sample` + `Gene`
 - `gene_feature_matrix`：`sample` + `Gene-embed-i` 或 `Gene-PCn`
 
 示例：

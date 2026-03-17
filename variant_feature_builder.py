@@ -1,6 +1,10 @@
-"""Build geno_df, genotype 012, gene-sequence, and gene-feature datasets.
+"""Build genotype and gene-feature matrices from site, VCF, and FASTA inputs.
 
-This pipeline consumes the site CSV exported by ``gwas_qtl_variant_extractor.py``.
+This pipeline consumes the site CSV exported by
+``gwas_qtl_variant_extractor.py``. It first extracts a 0/1/2 genotype matrix
+for the requested sites, then generates sample-specific gene sequences, embeds
+each gene independently, reduces each gene embedding block with PCA, and
+finally concatenates all per-gene PCA blocks into a single feature matrix.
 All genomic coordinates are interpreted as 1-based.
 """
 
@@ -33,7 +37,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 class VariantFeatureBuilder:
-    """End-to-end pipeline from site CSV + VCF + FASTA to downstream matrices."""
+    """Build per-sample genotype and per-gene PCA feature matrices."""
 
     SITE_COLUMNS = ["Chromosome", "Position", "Gene", "gene_start", "gene_end", "qtl_trait", "gwas_trait"]
     GENO_META_COLUMNS = ["Chromosome", "Position", "Gene", "gene_start", "gene_end", "REF", "ALT", "qtl_trait", "gwas_trait"]
@@ -54,7 +58,6 @@ class VariantFeatureBuilder:
         embedder_kwargs: dict | None = None,
         use_pca: bool = True,
         pca_var_threshold: float = 0.95,
-        gene_feature_format: str = "csv",
     ) -> None:
         if site_df_path is None and site_df is None:
             raise ValueError("site_df_path or site_df must be provided")
@@ -79,16 +82,10 @@ class VariantFeatureBuilder:
         self.embedder_kwargs = dict(embedder_kwargs or {})
         self.use_pca = bool(use_pca)
         self.pca_var_threshold = float(pca_var_threshold)
-        self.gene_feature_format = str(gene_feature_format).lower()
-
-        if self.gene_feature_format not in {"csv", "parquet"}:
-            raise ValueError("gene_feature_format must be one of: csv, parquet")
 
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.cache_dir = self.outdir / "embedding_cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.dict_dir = self.outdir / "dicts"
-        self.dict_dir.mkdir(parents=True, exist_ok=True)
         self.pca_dir = self.outdir / "pca_models"
         self.pca_dir.mkdir(parents=True, exist_ok=True)
 
@@ -145,20 +142,6 @@ class VariantFeatureBuilder:
             used.add(std)
             sample_map[sample] = std
         return sample_map
-
-    @staticmethod
-    def _save_json(data: dict, path: Path) -> None:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    @staticmethod
-    def _save_matrix(df: pd.DataFrame, path_without_suffix: Path, fmt: str) -> Path:
-        if fmt == "parquet":
-            path = path_without_suffix.with_suffix(".parquet")
-            df.to_parquet(path, index=False)
-            return path
-        path = path_without_suffix.with_suffix(".csv")
-        df.to_csv(path, index=False)
-        return path
 
     @staticmethod
     def _save_matrix_dual(df: pd.DataFrame, path_without_suffix: Path) -> tuple[Path, Path]:
@@ -532,13 +515,6 @@ class VariantFeatureBuilder:
     def _iter_gene_groups(self):
         assert self.geno_df is not None
         return self.geno_df.groupby("Gene", sort=True)
-
-    def build_genotype_012(self) -> dict[str, object]:
-        if self.genotype_012_meta is not None:
-            return dict(self.genotype_012_meta)
-        assert self.geno_df is not None
-        self.genotype_012_meta = self._save_genotype_012_from_geno_df(self.geno_df)
-        return dict(self.genotype_012_meta)
 
     def _validate_variant_ref_in_gene_seq(
         self,
@@ -918,22 +894,28 @@ def _parse_embedder_kwargs(raw: str | None) -> dict:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Build geno_df, genotype_012, gene_sequence_matrix, and gene_feature_matrix")
+    parser = argparse.ArgumentParser(
+        description="Build genotype_012 and per-gene PCA feature matrices from site CSV, VCF, and FASTA inputs"
+    )
     parser.add_argument("--site_df_path", required=True)
     parser.add_argument("--vcf_path", required=True)
     parser.add_argument("--fasta_path", required=True)
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--embedder_type", required=True, choices=["generator", "evo2", "nt", "agront", "rice8k"])
     parser.add_argument("--model_name_or_path", required=True)
-    parser.add_argument("--device", default="cpu")
-    parser.add_argument("--pooling", default="mean")
+    parser.add_argument("--device", default="cpu", help="Embedding device, e.g. cpu or cuda")
+    parser.add_argument("--pooling", default="mean", help="Embedding pooling method")
     parser.add_argument("--local_files_only", action="store_true", default=True)
     parser.add_argument("--no-local_files_only", dest="local_files_only", action="store_false")
     parser.add_argument("--embedder_kwargs", default=None, help='JSON object string, e.g. \'{"torch_dtype":"bfloat16"}\'')
     parser.add_argument("--use_pca", action="store_true", default=True)
     parser.add_argument("--no-use_pca", dest="use_pca", action="store_false")
-    parser.add_argument("--pca_var_threshold", type=float, default=0.95)
-    parser.add_argument("--gene_feature_format", choices=["csv", "parquet"], default="csv")
+    parser.add_argument(
+        "--pca_var_threshold",
+        type=float,
+        default=0.95,
+        help="Minimum cumulative explained variance retained for each gene PCA block",
+    )
     return parser
 
 
@@ -952,7 +934,6 @@ def main() -> None:
         embedder_kwargs=_parse_embedder_kwargs(args.embedder_kwargs),
         use_pca=args.use_pca,
         pca_var_threshold=args.pca_var_threshold,
-        gene_feature_format=args.gene_feature_format,
     ).run()
     print({name: meta.get("shape") for name, meta in outputs.items()})
 
