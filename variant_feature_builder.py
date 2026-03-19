@@ -607,15 +607,20 @@ class VariantFeatureBuilder:
             len(variant_rows),
             active_samples,
         )
-        return [
-            self._apply_variants_to_gene(
-                reference_seq=reference_seq,
-                gene_start=gene_start,
-                variant_rows=variant_rows,
-                sample=sample,
+        sample_sequences: list[str] = []
+        for sample in self.sample_columns:
+            if not bool(gene_df[sample].fillna(0).gt(0).any()):
+                sample_sequences.append(reference_seq)
+                continue
+            sample_sequences.append(
+                self._apply_variants_to_gene(
+                    reference_seq=reference_seq,
+                    gene_start=gene_start,
+                    variant_rows=variant_rows,
+                    sample=sample,
+                )
             )
-            for sample in self.sample_columns
-        ]
+        return sample_sequences
 
     def _embed_gene_sequences(self, seqs: list[str]) -> np.ndarray:
         unique_gene_sequences = sorted({seq for seq in seqs if seq})
