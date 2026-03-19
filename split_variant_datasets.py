@@ -1,4 +1,4 @@
-"""Split merged phenotype-genotype and phenotype-gene-feature datasets.
+"""Split genotype, gene-feature, and phenotype datasets by sample.
 
 Inputs are the `genotype_012` matrix, the `gene_feature_matrix`, and the site
 table produced by `gwas_qtl_variant_extractor.py`, plus a phenotype matrix.
@@ -123,13 +123,6 @@ def _align_three_by_sample(
     return genotype_aligned, gene_feature_aligned, phenotype_aligned
 
 
-def _merge_with_phenotype(feature_df: pd.DataFrame, phenotype_df: pd.DataFrame) -> pd.DataFrame:
-    merged = phenotype_df.merge(feature_df, on="sample", how="inner")
-    phenotype_cols = phenotype_df.columns.tolist()
-    feature_cols = [col for col in feature_df.columns if col != "sample"]
-    return merged.loc[:, ["sample", "value"] + [col for col in phenotype_cols[2:]] + feature_cols].copy()
-
-
 def _build_split_sample_lists(
     sample_list: list[str],
     test_ratio: float,
@@ -160,7 +153,7 @@ def _subset_by_samples(df: pd.DataFrame, sample_list: list[str]) -> pd.DataFrame
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Split genotype_012 and gene_feature_matrix into train_val_ds and test_ds"
+        description="Split genotype_012, gene_feature_matrix, and phenotype_df into train_val_ds and test_ds"
     )
     parser.add_argument("--genotype_012_path", required=True, help="Path to genotype_012 .csv or .parquet")
     parser.add_argument("--gene_feature_matrix_path", required=True, help="Path to gene_feature_matrix .csv or .parquet")
@@ -216,13 +209,12 @@ def main() -> None:
     genotype_df = _filter_genotype_columns(genotype_df, site_df, gene_list)
     gene_feature_df = _filter_gene_feature_columns(gene_feature_df, gene_list)
     genotype_df, gene_feature_df, phenotype_df = _align_three_by_sample(genotype_df, gene_feature_df, phenotype_df)
-    genotype_df = _merge_with_phenotype(genotype_df, phenotype_df)
-    gene_feature_df = _merge_with_phenotype(gene_feature_df, phenotype_df)
 
     logger.info(
-        "main: merged genotype shape=%s gene_feature shape=%s shared_samples=%d",
+        "main: aligned genotype shape=%s gene_feature shape=%s phenotype shape=%s shared_samples=%d",
         genotype_df.shape,
         gene_feature_df.shape,
+        phenotype_df.shape,
         len(genotype_df),
     )
 
@@ -238,11 +230,15 @@ def main() -> None:
     test_genotype = _subset_by_samples(genotype_df, test_samples)
     train_val_gene_feature = _subset_by_samples(gene_feature_df, train_val_samples)
     test_gene_feature = _subset_by_samples(gene_feature_df, test_samples)
+    train_val_phenotype = _subset_by_samples(phenotype_df, train_val_samples)
+    test_phenotype = _subset_by_samples(phenotype_df, test_samples)
 
     geno_train_csv, geno_train_parquet = _save_dual(train_val_genotype, outdir / "train_val_ds_genotype_012")
     geno_test_csv, geno_test_parquet = _save_dual(test_genotype, outdir / "test_ds_genotype_012")
     feat_train_csv, feat_train_parquet = _save_dual(train_val_gene_feature, outdir / "train_val_ds_gene_feature_matrix")
     feat_test_csv, feat_test_parquet = _save_dual(test_gene_feature, outdir / "test_ds_gene_feature_matrix")
+    pheno_train_csv, pheno_train_parquet = _save_dual(train_val_phenotype, outdir / "train_val_ds_phenotype")
+    pheno_test_csv, pheno_test_parquet = _save_dual(test_phenotype, outdir / "test_ds_phenotype")
 
     meta = {
         "n_samples": len(sample_list),
@@ -256,6 +252,8 @@ def main() -> None:
             "test_genotype_012": list(test_genotype.shape),
             "train_val_gene_feature_matrix": list(train_val_gene_feature.shape),
             "test_gene_feature_matrix": list(test_gene_feature.shape),
+            "train_val_phenotype": list(train_val_phenotype.shape),
+            "test_phenotype": list(test_phenotype.shape),
         },
         "samples": {
             "train_val": train_val_samples,
@@ -270,6 +268,10 @@ def main() -> None:
             "train_val_gene_feature_matrix_parquet": str(feat_train_parquet),
             "test_gene_feature_matrix_csv": str(feat_test_csv),
             "test_gene_feature_matrix_parquet": str(feat_test_parquet),
+            "train_val_phenotype_csv": str(pheno_train_csv),
+            "train_val_phenotype_parquet": str(pheno_train_parquet),
+            "test_phenotype_csv": str(pheno_test_csv),
+            "test_phenotype_parquet": str(pheno_test_parquet),
         },
     }
     meta_path = outdir / "split_meta.json"
