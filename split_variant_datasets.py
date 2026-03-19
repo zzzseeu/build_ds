@@ -37,10 +37,14 @@ def _save_dual(df: pd.DataFrame, path_without_suffix: Path) -> tuple[Path, Path]
     return csv_path, parquet_path
 
 
-def _parse_name_list(raw: str | None) -> list[str]:
-    if raw is None:
+def _read_name_df(path: Path | None) -> list[str]:
+    if path is None:
         return []
-    return [item.strip() for item in str(raw).split(",") if item.strip()]
+    df = pd.read_csv(path)
+    if df.empty or df.shape[1] == 0:
+        return []
+    values = df.iloc[:, 0].astype(str).map(str.strip)
+    return [value for value in values.tolist() if value]
 
 
 def _extract_gene_from_feature_col(col: str) -> str | None:
@@ -138,8 +142,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--site_df_path", required=True, help="Path to site file produced by gwas_qtl_variant_extractor.py")
     parser.add_argument("--outdir", required=True, help="Output directory for split datasets")
     parser.add_argument("--test_ratio", type=float, default=0.2, help="Fraction of samples kept in test set")
-    parser.add_argument("--isolated_sample_list", default=None, help="Comma-separated sample names that must be kept in test set")
-    parser.add_argument("--gene_list", default=None, help="Comma-separated genes used to filter feature columns")
+    parser.add_argument(
+        "--isolated_sample_df",
+        default=None,
+        help="Optional CSV file; the first column contains sample names that must be kept in test set",
+    )
+    parser.add_argument(
+        "--gene_df",
+        default=None,
+        help="Optional CSV file; the first column contains gene names used to filter feature columns",
+    )
     parser.add_argument("--random_state", type=int, default=42, help="Random seed for split reproducibility")
     return parser
 
@@ -155,8 +167,8 @@ def main() -> None:
     gene_feature_path = Path(args.gene_feature_matrix_path)
     site_df_path = Path(args.site_df_path)
 
-    gene_list = _parse_name_list(args.gene_list)
-    isolated_sample_list = _parse_name_list(args.isolated_sample_list)
+    gene_list = _read_name_df(Path(args.gene_df)) if args.gene_df else []
+    isolated_sample_list = _read_name_df(Path(args.isolated_sample_df)) if args.isolated_sample_df else []
     if not 0 < float(args.test_ratio) < 1:
         raise ValueError("test_ratio must be between 0 and 1")
 
