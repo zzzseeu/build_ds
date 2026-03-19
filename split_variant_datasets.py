@@ -1,9 +1,10 @@
-"""Split genotype and gene-feature datasets into train_val and test subsets.
+"""Split merged phenotype-genotype and phenotype-gene-feature datasets.
 
 Inputs are the `genotype_012` matrix, the `gene_feature_matrix`, and the site
-table produced by `gwas_qtl_variant_extractor.py`. Splitting is sample-based.
-Optional gene filtering keeps only SNP features mapped to the requested genes
-and only gene-feature columns derived from those genes.
+table produced by `gwas_qtl_variant_extractor.py`, plus a phenotype matrix.
+Splitting is sample-based. Optional gene filtering keeps only SNP features
+mapped to the requested genes and only gene-feature columns derived from those
+genes.
 """
 
 from __future__ import annotations
@@ -90,19 +91,43 @@ def _filter_gene_feature_columns(
     return gene_feature_df.loc[:, keep_cols].copy()
 
 
-def _align_by_sample(
+def _validate_and_reorder_phenotype_df(phenotype_df: pd.DataFrame) -> pd.DataFrame:
+    if phenotype_df.shape[1] < 2:
+        raise ValueError("phenotype_df must have at least two columns: sample and value")
+    columns = phenotype_df.columns.tolist()
+    ordered = [columns[0], columns[1]] + columns[2:]
+    out = phenotype_df.loc[:, ordered].copy()
+    out = out.rename(columns={ordered[0]: "sample", ordered[1]: "value"})
+    out["sample"] = out["sample"].astype(str)
+    return out
+
+
+def _align_three_by_sample(
     genotype_df: pd.DataFrame,
     gene_feature_df: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    phenotype_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     geno_samples = genotype_df["sample"].astype(str)
-    feature_samples = gene_feature_df["sample"].astype(str)
-    shared_samples = [sample for sample in geno_samples.tolist() if sample in set(feature_samples.tolist())]
+    feature_samples = set(gene_feature_df["sample"].astype(str).tolist())
+    phenotype_samples = set(phenotype_df["sample"].astype(str).tolist())
+    shared_samples = [
+        sample for sample in geno_samples.tolist()
+        if sample in feature_samples and sample in phenotype_samples
+    ]
     if not shared_samples:
-        raise ValueError("No shared samples found between genotype_012 and gene_feature_matrix")
+        raise ValueError("No shared samples found across genotype_012, gene_feature_matrix, and phenotype_df")
 
     genotype_aligned = genotype_df.set_index("sample").loc[shared_samples].reset_index()
     gene_feature_aligned = gene_feature_df.set_index("sample").loc[shared_samples].reset_index()
-    return genotype_aligned, gene_feature_aligned
+    phenotype_aligned = phenotype_df.set_index("sample").loc[shared_samples].reset_index()
+    return genotype_aligned, gene_feature_aligned, phenotype_aligned
+
+
+def _merge_with_phenotype(feature_df: pd.DataFrame, phenotype_df: pd.DataFrame) -> pd.DataFrame:
+    merged = phenotype_df.merge(feature_df, on="sample", how="inner")
+    phenotype_cols = phenotype_df.columns.tolist()
+    feature_cols = [col for col in feature_df.columns if col != "sample"]
+    return merged.loc[:, ["sample", "value"] + [col for col in phenotype_cols[2:]] + feature_cols].copy()
 
 
 def _build_split_sample_lists(
@@ -139,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--genotype_012_path", required=True, help="Path to genotype_012 .csv or .parquet")
     parser.add_argument("--gene_feature_matrix_path", required=True, help="Path to gene_feature_matrix .csv or .parquet")
+    parser.add_argument("--phenotype_df", required=True, help="Phenotype CSV; first column is sample, second column is value")
     parser.add_argument("--site_df_path", required=True, help="Path to site file produced by gwas_qtl_variant_extractor.py")
     parser.add_argument("--outdir", required=True, help="Output directory for split datasets")
     parser.add_argument("--test_ratio", type=float, default=0.2, help="Fraction of samples kept in test set")
@@ -165,6 +191,7 @@ def main() -> None:
 
     genotype_path = Path(args.genotype_012_path)
     gene_feature_path = Path(args.gene_feature_matrix_path)
+    phenotype_path = Path(args.phenotype_df)
     site_df_path = Path(args.site_df_path)
 
     gene_list = _read_name_df(Path(args.gene_df)) if args.gene_df else []
@@ -175,21 +202,25 @@ def main() -> None:
     logger.info("main: loading input tables")
     genotype_df = _read_table(genotype_path)
     gene_feature_df = _read_table(gene_feature_path)
+    phenotype_df = _validate_and_reorder_phenotype_df(pd.read_csv(phenotype_path))
     site_df = _read_table(site_df_path)
 
     logger.info(
-        "main: loaded genotype shape=%s gene_feature shape=%s site_df shape=%s",
+        "main: loaded genotype shape=%s gene_feature shape=%s phenotype shape=%s site_df shape=%s",
         genotype_df.shape,
         gene_feature_df.shape,
+        phenotype_df.shape,
         site_df.shape,
     )
 
     genotype_df = _filter_genotype_columns(genotype_df, site_df, gene_list)
     gene_feature_df = _filter_gene_feature_columns(gene_feature_df, gene_list)
-    genotype_df, gene_feature_df = _align_by_sample(genotype_df, gene_feature_df)
+    genotype_df, gene_feature_df, phenotype_df = _align_three_by_sample(genotype_df, gene_feature_df, phenotype_df)
+    genotype_df = _merge_with_phenotype(genotype_df, phenotype_df)
+    gene_feature_df = _merge_with_phenotype(gene_feature_df, phenotype_df)
 
     logger.info(
-        "main: filtered genotype shape=%s gene_feature shape=%s shared_samples=%d",
+        "main: merged genotype shape=%s gene_feature shape=%s shared_samples=%d",
         genotype_df.shape,
         gene_feature_df.shape,
         len(genotype_df),
@@ -219,6 +250,7 @@ def main() -> None:
         "random_state": int(args.random_state),
         "isolated_sample_list": isolated_sample_list,
         "gene_list": gene_list,
+        "phenotype_df": str(phenotype_path),
         "shapes": {
             "train_val_genotype_012": list(train_val_genotype.shape),
             "test_genotype_012": list(test_genotype.shape),

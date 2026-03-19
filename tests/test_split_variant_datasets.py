@@ -3,10 +3,12 @@ import unittest
 import pandas as pd
 
 from split_variant_datasets import (
-    _align_by_sample,
+    _align_three_by_sample,
     _build_split_sample_lists,
     _filter_gene_feature_columns,
     _filter_genotype_columns,
+    _merge_with_phenotype,
+    _validate_and_reorder_phenotype_df,
 )
 
 
@@ -53,14 +55,29 @@ class SplitVariantDatasetsTest(unittest.TestCase):
         self.assertIn("S5", test)
         self.assertEqual(sorted(train_val + test), ["S1", "S2", "S3", "S4", "S5"])
 
-    def test_align_by_sample_uses_shared_order(self) -> None:
+    def test_align_three_by_sample_uses_shared_order(self) -> None:
         genotype_df = pd.DataFrame({"sample": ["S2", "S1"], "Chr1:10": [1, 0]})
         gene_feature_df = pd.DataFrame({"sample": ["S1", "S2", "S3"], "GeneA-PC1": [0.1, 0.2, 0.3]})
+        phenotype_df = pd.DataFrame({"sample": ["S2", "S1", "S4"], "value": [2.0, 1.0, 4.0], "site": ["A", "B", "C"]})
 
-        aligned_genotype, aligned_feature = _align_by_sample(genotype_df, gene_feature_df)
+        aligned_genotype, aligned_feature, aligned_pheno = _align_three_by_sample(
+            genotype_df,
+            gene_feature_df,
+            phenotype_df,
+        )
 
         self.assertEqual(aligned_genotype["sample"].tolist(), ["S2", "S1"])
         self.assertEqual(aligned_feature["sample"].tolist(), ["S2", "S1"])
+        self.assertEqual(aligned_pheno["sample"].tolist(), ["S2", "S1"])
+
+    def test_merge_with_phenotype_orders_columns(self) -> None:
+        phenotype_df = pd.DataFrame({"sid": ["S1", "S2"], "trait": [1.0, 2.0], "location": ["L1", "L2"]})
+        phenotype_df = _validate_and_reorder_phenotype_df(phenotype_df)
+        genotype_df = pd.DataFrame({"sample": ["S1", "S2"], "Chr1:10": [0, 1], "Chr1:20": [1, 0]})
+
+        merged = _merge_with_phenotype(genotype_df, phenotype_df)
+
+        self.assertEqual(merged.columns.tolist(), ["sample", "value", "location", "Chr1:10", "Chr1:20"])
 
 
 if __name__ == "__main__":
