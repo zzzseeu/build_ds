@@ -242,3 +242,6 @@ test_inputs/
 *.so
 *.tbi
 *.csi
+
+
+configs/*

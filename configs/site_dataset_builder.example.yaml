@@ -1,0 +1,28 @@
+gwas_csv_path: genotype/gwas0310.csv
+qtl_csv_path: genotype/qtl0310.csv
+gff3_path: ../rawdata/msu.gff3
+fasta_path: ../rawdata/msu.all.fasta
+vcf_path: ../rawdata/msu7_chr_fixed.snp_indel.merged.maf0.05.missing0.1.vcf.gz
+type: intersect
+outdir: ./site_dataset_builder
+
+ext_len: 500
+k: 500
+gene_csv_path: null
+gff3_feature: gene
+use_gffutils: true
+
+pvalue_threshold: 1000000.0
+LOD_threshold: 3
+PVE_threshold: 5
+
+embedder_type: agront
+model_name_or_path: InstaDeepAI/agro-nucleotide-transformer-1b
+device: cuda
+pooling: mean
+local_files_only: true
+embedder_kwargs: {}
+
+split_test_ratio: 0.2
+isolated_sample_csv: null
+split_random_state: 42
