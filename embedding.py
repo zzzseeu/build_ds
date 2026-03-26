@@ -83,11 +83,26 @@ class UnifiedEmbedder:
     >>> embedding = embedder("ATCGATCG")
     """
 
-    def __init__(self, embedder_type: str, **kwargs):
-        self.embedder = load_pretrained(embedder_type, **kwargs)
+    def __init__(
+        self,
+        embedder_type: str,
+        model_name_or_path: str,
+        device: str = "cuda",
+        pooling: str = "mean",
+        local_files_only: bool = True,
+        **kwargs,
+    ):
+        init_kwargs = {
+            "model_name_or_path": model_name_or_path,
+            "device": device,
+            "pooling": pooling,
+            "local_files_only": local_files_only,
+        }
+        init_kwargs.update(kwargs)
+        self.embedder = load_pretrained(embedder_type, **init_kwargs)
         self.embedder_type = embedder_type
 
-    def __call__(self, sequence: str):
+    def __call__(self, sequence: str | list[str]):
         """Generate embedding for a DNA sequence.
 
         Parameters

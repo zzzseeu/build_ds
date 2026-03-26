@@ -1,178 +1,182 @@
 # Build DS Toolkit
 
-用于从 `GWAS/QTL/VCF/FASTA` 构建多种变异特征数据集的脚本集合。
+当前项目以 [site_dataset_builder.py](/Users/seeu/Desktop/Project/build_ds/site_dataset_builder.py) 作为唯一推荐的完整流程入口，用于从 `GWAS/QTL/GFF3/VCF/FASTA` 构建多种样本级特征数据集。
 
-## 模块说明
+## 当前保留的核心模块
 
-### 1) `gwas_qtl_variant_extractor.py`
-- 作用：
-  - 读取 GWAS 位点和 QTL 区间；
-  - 根据 `intersection/union` 与 VCF 位点整合；
-  - 可选按基因区间过滤；
-  - 输出标准位点表（1-based）。
-- 核心输出列：
-  - `Chromosome`
-  - `Position`
-  - `Gene_id`
-  - `Gene_position`
+### 1. `site_dataset_builder.py`
 
-### 2) `variant_feature_builder.py`
-- 作用：
-  - 读取位点表 + VCF + FASTA；
-  - 构建多类型特征矩阵；
-  - 支持 embedding 缓存、PCA、数据集切分。
-- 核心输出：
-  - `genotype_012`
-  - `gene_sequence`
-  - `gene_pca`
-  - `concat_embedding`
-  - `extseq_raw`
-  - `extseq_pca`
-  - `distance_x_gt`
-  - `split_train/split_val/split_test`
-  - `meta.json`
+这是当前项目的主脚本，负责完成整条数据构建流程，包括：
 
-### 3) `embedder.py`
-- 作用：具体模型加载实现（Rice8k/NT/Evo2 等）。
-- `variant_feature_builder.py` 内已集成 `UnifiedEmbedder` 接口，会调用本文件中的模型类。
+- 读取并标准化 GWAS、QTL、GFF3、VCF、FASTA
+- 根据 `type=union/intersect` 筛选候选位点
+- 根据基因区间和 `ext_len` 进一步过滤位点
+- 可选根据 `gene_csv_path` 保留指定基因
+- 从 VCF 中提取样本基因型并构建 `genotype_012`
+- 基于局部序列上下文构建 `variant_effect_matrix`
+- 基于样本特异性基因序列构建 `gene_sequence_feature_matrix`
+- 可选进一步自动拆分 `train_val/test` 数据集
+
+支持的主输入参数包括：
+
+- `gwas_csv_path`
+- `qtl_csv_path`
+- `gff3_path`
+- `fasta_path`
+- `vcf_path`
+- `type`
+
+常用扩展参数包括：
+
+- `ext_len`
+- `k`
+- `gene_csv_path`
+- `pvalue_threshold`
+- `LOD_threshold`
+- `PVE_threshold`
+- `embedder_type`
+- `model_name_or_path`
+- `split_test_ratio`
+- `isolated_sample_csv`
+- `split_random_state`
+
+### 2. `utils.py`
+
+当前 `utils.py` 只保留基础通用能力，不再承载重复的数据构建流程函数。
+
+主要包括：
+
+- `initLogger`
+- `getLogger`
+- `standard_chrom`
+- `standard_sample_name`
+- `parse_gff3_attributes`
+- `extract_gff3_feature_intervals`
+- `extract_gff3_feature_intervals_gffutils`
+- `build_feature_interval_trees`
+- `extract_gff3_feature_interval_trees`
+- `extract_gff3_feature_interval_trees_gffutils`
+- `query_feature_interval_trees`
+
+### 3. `embedder.py`
+
+负责具体模型加载与序列 embedding 计算。
+
+### 4. `embedding.py`
+
+提供 `UnifiedEmbedder` 统一封装，用于在主脚本中按统一接口调用不同 embedder。
+
+## 已清理的重复脚本
+
+以下旧脚本的主要功能已经被 `site_dataset_builder.py` 覆盖，因此已清理：
+
+- `gwas_qtl_variant_extractor.py`
+- `variant_feature_builder.py`
+- `split_variant_datasets.py`
+
+对应的旧测试也已同步清理。
 
 ## 依赖
 
-推荐在 `py-bioinfo` 环境中安装：
+推荐在生信环境中安装：
 
 ```bash
 conda activate py-bioinfo
-pip install pandas numpy pysam intervaltree scikit-learn transformers
+pip install pandas numpy pysam intervaltree transformers loguru pyyaml tqdm
 ```
 
-如果使用 Rice8k 等模型，还需要对应模型权重与运行环境（GPU、flash attention 等）。
+如果使用特定 DNA 语言模型，还需要对应模型权重和运行环境。
 
 ## 输入数据格式
 
-### GWAS 文件（CSV）
-- 必需列：`Chromosome, Position, Trait`
+### GWAS 文件
 
-### QTL 文件（CSV）
-- 必需列：`Chromosome, Start, End, Trait, QTL_name`
+必需列：
 
-### 基因区间文件（CSV，可选）
-- 必需列：`Chromosome, Start, End, Gene_id`
+- `Chromosome`
+- `Position`
+- `Trait`
 
-### VariantSelector 输出位点文件（CSV）
-- 必需列：`Chromosome, Position, Gene_id, Gene_position`
+常见可选列：
 
-### VCF
-- 坐标按 1-based。
-- `variant_feature_builder.py` 会读取样本基因型 `GT`，并转为 `0/1/2`。
+- `pvalue`
 
-### FASTA
-- 染色体 ID 需与 VCF/位点文件可对应。
+### QTL 文件
 
-## 使用示例
+必需列：
 
-## A. 位点整合与过滤（GWAS + QTL）
+- `Chromosome`
+- `start_pos`
+- `end_pos`
+- `Trait`
+
+常见可选列：
+
+- `QTL`
+- `LOD`
+- `PVE`
+
+### GFF3/GTF 文件
+
+用于提供基因区间注释。
+
+### VCF 文件
+
+用于提取样本基因型信息。
+
+### FASTA 文件
+
+用于提取局部序列和基因参考序列。
+
+## 命令行运行方式
+
+脚本通过 YAML 配置文件运行：
 
 ```bash
-conda run -n py-bioinfo python /path/to/project/gwas_qtl_variant_extractor.py \
-  --gwas_path /path/to/project/test_inputs/gwas_sites.csv \
-  --qtl_path /path/to/project/test_inputs/qtl_intervals.csv \
-  --vcf_path /path/to/project/test_inputs/variants.vcf \
-  --type union \
-  --gene_interval_path /path/to/project/test_inputs/gene_intervals.csv \
-  --ext_length 0 \
-  --outdir /path/to/project/test_outputs \
-  --out_prefix demo
+python3 /Users/seeu/Desktop/Project/build_ds/site_dataset_builder.py \
+  --config /Users/seeu/Desktop/Project/build_ds/site_dataset_builder.example.yaml
 ```
 
-输出示例文件：
-- `/path/to/project/test_outputs/demo_union.csv`
+## 配置模板
 
-## B. 构建特征数据集（CLI）
+项目中提供了配置模板：
 
-```bash
-conda run -n py-bioinfo python /path/to/project/variant_feature_builder.py \
-  --variant_df_path /path/to/project/test_outputs/demo_union.csv \
-  --vcf_path /path/to/project/test_inputs/variants.vcf \
-  --fasta_path /path/to/project/test_inputs/genome.fa \
-  --outdir /path/to/project/test_outputs/feature_demo \
-  --model_name_or_path /path/to/models/rice_1B_stage2_8k_hf \
-  --device cuda \
-  --torch_dtype bfloat16 \
-  --use_flash_attention \
-  --pooling mean \
-  --test_ratio 0.2 \
-  --val_ratio 0.1 \
-  --random_seed 42 \
-  --flank_k 20 \
-  --pca_var_threshold 0.95 \
-  --isolated_sample S001 S002 \
-  --file_format csv
-```
+- [site_dataset_builder.example.yaml](/Users/seeu/Desktop/Project/build_ds/site_dataset_builder.example.yaml)
 
-说明：
-- 若 `--model_name_or_path` 不可用，可在 Python API 中传入自定义 mock embedder 进行流程验证。
+## 逻辑说明文档
 
-## C. 构建特征数据集（Python API）
+完整逻辑说明见：
 
-```python
-import torch
-from variant_feature_builder import VariantFeatureBuilder, UnifiedEmbedder
+- [SITE_DATASET_BUILDER_LOGIC.md](/Users/seeu/Desktop/Project/build_ds/SITE_DATASET_BUILDER_LOGIC.md)
 
-embedder = UnifiedEmbedder(
-    "rice8k",
-    model_name_or_path="/path/to/models/rice_1B_stage2_8k_hf",
-    device="cuda",
-    torch_dtype=torch.bfloat16,
-    use_flash_attention=True,
-    pooling="mean",
-)
+## 典型输出
 
-builder = VariantFeatureBuilder(
-    variant_df_path="/path/to/project/test_outputs/demo_union.csv",
-    vcf_path="/path/to/project/test_inputs/variants.vcf",
-    fasta_path="/path/to/project/test_inputs/genome.fa",
-    outdir="/path/to/project/test_outputs/feature_demo_api",
-    embedder=embedder,
-    isolated_sample=["S001", "S002"],
-    test_ratio=0.2,
-    val_ratio=0.1,
-    random_seed=42,
-    flank_k=20,
-    pca_var_threshold=0.95,
-    save_file=True,
-    file_format="csv",
-)
+主流程通常会输出：
 
-outputs = builder.run()
-print(outputs["genotype_012"].shape)
-print(outputs["gene_pca"].shape)
-```
+- `sites_union_or_intersect.csv`
+- `sites_in_gene.csv`
+- `sample_name_mapping.csv`
+- `genotype_012_site_by_sample.csv`
+- `genotype_012.csv`
+- `genotype_012.parquet`
+- `variant_effect_matrix.csv`
+- `variant_effect_matrix.parquet`
+- `gene_sequence_feature_matrix.csv`
+- `gene_sequence_feature_matrix.parquet`
+- `site_dataset_builder.log`
 
-## 输出列命名约定
+如果配置了数据集拆分，还会额外输出：
 
-位点相关特征列使用统一命名：
-
-`Chr:Position:Ref>Alt-gene_id`
-
-示例：
-- `Chr1:100:A>G-GeneX`
-- `Chr2:350:C>T-GeneY_PC1`（PCA 列会追加 `_PCn`）
-
-## 常见问题
-
-### 1) 模型路径报 HuggingFace repo id 错误
-- 原因：本地路径不可达或被识别为 repo id。
-- 处理：检查模型目录是否存在、权限是否可读，或改为正确的 HF repo 名。
-
-### 2) VCF 无样本列导致 012 特征异常
-- 需要包含 `FORMAT` 和样本 `GT` 列。
-
-### 3) 染色体命名不一致（如 `chr1`/`Chr1`/`1`）
-- 建议先通过位点提取脚本的标准化流程统一，再进入特征构建。
-
-## 文件清单（当前项目）
-- `/path/to/project/gwas_qtl_variant_extractor.py`
-- `/path/to/project/variant_feature_builder.py`
-- `/path/to/project/embedder.py`
-- `/path/to/project/test_inputs/`
-- `/path/to/project/test_outputs/`
+- `splits/train_val_genotype_012.csv`
+- `splits/train_val_genotype_012.parquet`
+- `splits/test_genotype_012.csv`
+- `splits/test_genotype_012.parquet`
+- `splits/train_val_variant_effect_matrix.csv`
+- `splits/train_val_variant_effect_matrix.parquet`
+- `splits/test_variant_effect_matrix.csv`
+- `splits/test_variant_effect_matrix.parquet`
+- `splits/train_val_gene_sequence_feature_matrix.csv`
+- `splits/train_val_gene_sequence_feature_matrix.parquet`
+- `splits/test_gene_sequence_feature_matrix.csv`
+- `splits/test_gene_sequence_feature_matrix.parquet`
+- `splits/split_meta.json`
