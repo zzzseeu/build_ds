@@ -1,0 +1,28 @@
+gwas_csv_path: /path/to/gwas.csv
+qtl_csv_path: /path/to/qtl.csv
+gff3_path: /path/to/annotation.gff3
+fasta_path: /path/to/genome.fa
+vcf_path: /path/to/variants.vcf
+type: intersect
+outdir: /path/to/output/site_dataset_builder
+
+ext_len: 500
+k: 100
+gene_csv_path: null
+gff3_feature: gene
+use_gffutils: false
+
+pvalue_threshold: 1000000.0
+LOD_threshold: 2.5
+PVE_threshold: 10.0
+
+embedder_type: rice8k
+model_name_or_path: /path/to/models/rice_1B_stage2_8k_hf
+device: cuda
+pooling: mean
+local_files_only: true
+embedder_kwargs: {}
+
+split_test_ratio: 0.2
+isolated_sample_csv: null
+split_random_state: 42
