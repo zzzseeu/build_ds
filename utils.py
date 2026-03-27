@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -162,6 +163,24 @@ def classify_variant_type(ref: str, alt: str) -> str:
     if len(ref) > len(alt):
         return "Deletion"
     return "Complex"
+
+
+class CachedSequenceEmbedder:
+    """Wrap a callable embedder with on-disk sequence-level caching."""
+
+    def __init__(self, cache_dir: str | Path, embedder):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.embedder = embedder
+
+    def embed_sequence(self, seq: str) -> np.ndarray:
+        seq_hash = hashlib.sha1(seq.encode("utf-8")).hexdigest()
+        cache_path = self.cache_dir / f"{seq_hash}.npy"
+        if cache_path.exists():
+            return np.load(cache_path)
+        vec = to_numpy_1d_embedding(self.embedder(seq))
+        np.save(cache_path, vec)
+        return vec
 
 
 def parse_gff3_attributes(attr_text: str) -> dict[str, str]:

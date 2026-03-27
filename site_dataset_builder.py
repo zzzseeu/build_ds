@@ -13,6 +13,7 @@ import pandas as pd
 
 from utils import (
     build_fasta_chrom_map,
+    CachedSequenceEmbedder,
     extract_gff3_feature_interval_trees,
     extract_gff3_feature_interval_trees_gffutils,
     fetch_window_with_padding,
@@ -20,7 +21,6 @@ from utils import (
     query_feature_interval_trees,
     standard_chrom,
     standard_sample_name,
-    to_numpy_1d_embedding,
 )
 
 try:
@@ -88,6 +88,7 @@ class SiteDatasetBuilder:
             local_files_only=self.local_files_only,
             **self.embedder_kwargs,
         )
+        self.cached_embedder = CachedSequenceEmbedder(self.cache_dir, self.embedder)
 
     def _stage_cache_path(self, name: str) -> Path:
         return self.resume_dir / name
@@ -320,13 +321,7 @@ class SiteDatasetBuilder:
         return (10**9, str(chrom))
 
     def _embed_sequence(self, seq: str) -> np.ndarray:
-        seq_hash = hashlib.sha1(seq.encode("utf-8")).hexdigest()
-        cache_path = self.cache_dir / f"{seq_hash}.npy"
-        if cache_path.exists():
-            return np.load(cache_path)
-        vec = to_numpy_1d_embedding(self.embedder(seq))
-        np.save(cache_path, vec)
-        return vec
+        return self.cached_embedder.embed_sequence(seq)
 
     def _load_gene_filter(self) -> set[str] | None:
         if not self.gene_csv_path:

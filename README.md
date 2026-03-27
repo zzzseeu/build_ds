@@ -66,7 +66,7 @@
 
 提供 `UnifiedEmbedder` 统一封装，用于在主脚本中按统一接口调用不同 embedder。
 
-### 5. `variant_tsv_alt_pca.py`
+### 5. `variant_tsv_embedding_classifier.py`
 
 用于读取 `TSV + VCF + FASTA`：
 
@@ -74,13 +74,14 @@
 - 提取位点上下游 `k` 长度窗口
 - 分别构造 `REF` 和 `ALT` 序列
 - 对 `REF/ALT` 序列做 embedding
-- 基于 `ALT` embedding 做 PCA
-- 按 `mutation_type` 区分 `SNV / Insertion / Deletion / MNV`
+- 以 `VARIANT_TYPE` 作为标签做二分类或多分类建模
+- 以 embedding 向量作为特征进行监督学习评估
+- 输出 `AUC / PR AUC / F1 / Accuracy` 等指标
 
 典型运行方式：
 
 ```bash
-python3 /Users/seeu/Desktop/Project/build_ds/variant_tsv_alt_pca.py \
+python3 /Users/seeu/Desktop/Project/build_ds/variant_tsv_embedding_classifier.py \
   --tsv-path /path/to/sites.tsv \
   --vcf-path /path/to/variants.vcf.gz \
   --fasta-path /path/to/genome.fa \
@@ -89,18 +90,24 @@ python3 /Users/seeu/Desktop/Project/build_ds/variant_tsv_alt_pca.py \
   --embedder-type rice8k \
   --model-name-or-path /path/to/embedder_model \
   --device cuda \
+  --task-type auto \
+  --feature-type alt \
+  --model-type logistic_regression \
   --local-files-only
 ```
 
 主要输出：
 
 - `variant_sequences.tsv`
-- `alt_embedding_pca.tsv`
-- `alt_embedding_pca.png`
+- `labels.tsv`
+- `features.npy`
+- `predictions.tsv`
+- `metrics.json`
+- `confusion_matrix.tsv`
+- `classification_report.txt`
 - `ref_embeddings.npy`
 - `alt_embeddings.npy`
 - `alt_minus_ref_embeddings.npy`
-- `summary.json`
 
 ## 已清理的重复脚本
 
