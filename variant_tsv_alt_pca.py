@@ -34,6 +34,7 @@ TSV_COLUMN_ALIASES = {
     "position": "Position",
     "ref": "REF",
     "alt": "ALT",
+    "variant_type": "VARIANT_TYPE",
 }
 
 
@@ -69,7 +70,14 @@ def make_site_key(chrom: str, pos: int, ref: str | None = None, alt: str | None 
     return (str(chrom), int(pos), ref if ref else None, alt if alt else None)
 
 
-def load_tsv_sites(tsv_path: Path) -> tuple[pd.DataFrame, set[tuple[str, int]], set[tuple[str, int, str | None, str | None]]]:
+def load_tsv_sites(
+    tsv_path: Path,
+) -> tuple[
+    pd.DataFrame,
+    set[tuple[str, int]],
+    set[tuple[str, int, str | None, str | None]],
+    dict[tuple[str, int, str | None, str | None], str],
+]:
     site_df = infer_site_columns(pd.read_csv(tsv_path, sep="\t"))
     positional_keys = {
         (str(row.Chromosome), int(row.Position))
@@ -84,7 +92,19 @@ def load_tsv_sites(tsv_path: Path) -> tuple[pd.DataFrame, set[tuple[str, int]], 
         )
         for row in site_df.itertuples(index=False)
     }
-    return site_df, positional_keys, allele_keys
+    variant_type_map: dict[tuple[str, int, str | None, str | None], str] = {}
+    if "VARIANT_TYPE" in site_df.columns:
+        for row in site_df.itertuples(index=False):
+            key = make_site_key(
+                row.Chromosome,
+                row.Position,
+                getattr(row, "REF", None),
+                getattr(row, "ALT", None),
+            )
+            value = str(getattr(row, "VARIANT_TYPE", "")).strip()
+            if value:
+                variant_type_map[key] = value
+    return site_df, positional_keys, allele_keys, variant_type_map
 
 
 def collect_variants_from_vcf(
@@ -92,6 +112,7 @@ def collect_variants_from_vcf(
     site_df: pd.DataFrame,
     positional_keys: set[tuple[str, int]],
     allele_keys: set[tuple[str, int, str | None, str | None]],
+    variant_type_map: dict[tuple[str, int, str | None, str | None], str],
 ) -> pd.DataFrame:
     try:
         import pysam  # type: ignore
@@ -112,15 +133,17 @@ def collect_variants_from_vcf(
             ref = str(rec.ref).upper()
             for alt in rec.alts or ():
                 alt = str(alt).upper()
-                if has_allele_filter and make_site_key(chrom, rec.pos, ref, alt) not in allele_keys:
+                allele_key = make_site_key(chrom, rec.pos, ref, alt)
+                if has_allele_filter and allele_key not in allele_keys:
                     continue
+                variant_type = variant_type_map.get(allele_key) or classify_variant_type(ref, alt)
                 rows.append(
                     {
                         "Chromosome": chrom,
                         "Position": int(rec.pos),
                         "REF": ref,
                         "ALT": alt,
-                        "mutation_type": classify_variant_type(ref, alt),
+                        "VARIANT_TYPE": variant_type,
                     }
                 )
 
@@ -200,7 +223,7 @@ def add_sequence_windows(variant_df: pd.DataFrame, fasta_path: Path, k: int) -> 
                     "REF": ref,
                     "ALT": alt,
                     "site_id": f"{chrom}:{pos}:{ref}>{alt}",
-                    "mutation_type": classify_variant_type(ref, alt),
+                    "VARIANT_TYPE": str(getattr(row, "VARIANT_TYPE", "")).strip() or classify_variant_type(ref, alt),
                     "upstream_seq": upstream,
                     "downstream_seq": downstream,
                     "ref_seq": upstream + ref + downstream,
@@ -235,11 +258,11 @@ def maybe_plot_pca(pca_df: pd.DataFrame, explained: np.ndarray, out_path: Path, 
         return None
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    for mutation_type, sub_df in pca_df.groupby("mutation_type", dropna=False):
-        ax.scatter(sub_df["PC1"], sub_df["PC2"], s=28, alpha=0.8, label=str(mutation_type))
+    for variant_type, sub_df in pca_df.groupby("VARIANT_TYPE", dropna=False):
+        ax.scatter(sub_df["PC1"], sub_df["PC2"], s=28, alpha=0.8, label=str(variant_type))
     ax.set_xlabel(f"PC1 ({explained[0] * 100:.2f}%)")
     ax.set_ylabel(f"PC2 ({explained[1] * 100:.2f}%)")
-    ax.set_title("ALT embedding PCA by mutation type")
+    ax.set_title("ALT embedding PCA by VARIANT_TYPE")
     ax.legend()
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
@@ -269,10 +292,16 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     logger = initLogger(outdir / "variant_tsv_alt_pca.log")
 
-    site_df, positional_keys, allele_keys = load_tsv_sites(Path(args.tsv_path))
+    site_df, positional_keys, allele_keys, variant_type_map = load_tsv_sites(Path(args.tsv_path))
     logger.info(f"Loaded TSV sites: {len(site_df)}")
 
-    variant_df = collect_variants_from_vcf(Path(args.vcf_path), site_df, positional_keys, allele_keys)
+    variant_df = collect_variants_from_vcf(
+        Path(args.vcf_path),
+        site_df,
+        positional_keys,
+        allele_keys,
+        variant_type_map,
+    )
     if variant_df.empty:
         raise ValueError("No matching VCF variants found for TSV sites")
     logger.info(f"Matched VCF variants: {len(variant_df)}")
@@ -313,7 +342,7 @@ def main() -> None:
 
     coords, explained = run_pca(alt_matrix, n_components=max(2, int(args.pca_components)))
     coord_cols = {f"PC{i + 1}": coords[:, i] for i in range(coords.shape[1])}
-    pca_df = seq_df[["site_id", "Chromosome", "Position", "REF", "ALT", "mutation_type"]].copy()
+    pca_df = seq_df[["site_id", "Chromosome", "Position", "REF", "ALT", "VARIANT_TYPE"]].copy()
     for key, value in coord_cols.items():
         pca_df[key] = value
     pca_df.to_csv(outdir / "alt_embedding_pca.tsv", sep="\t", index=False)
@@ -326,8 +355,8 @@ def main() -> None:
         "embedder_type": str(args.embedder_type),
         "pca_components": int(coords.shape[1]),
         "explained_variance_ratio": [float(x) for x in explained[: coords.shape[1]]],
-        "mutation_type_counts": {
-            str(k): int(v) for k, v in pca_df["mutation_type"].value_counts().sort_index().items()
+        "variant_type_counts": {
+            str(k): int(v) for k, v in pca_df["VARIANT_TYPE"].value_counts().sort_index().items()
         },
         "outputs": {
             "variant_sequences_tsv": str(outdir / "variant_sequences.tsv"),
