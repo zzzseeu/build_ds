@@ -8,6 +8,7 @@ from typing import Iterable
 import re
 from urllib.parse import unquote
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -98,6 +99,69 @@ def standard_sample_name(sample: str) -> str | None:
     if match is None:
         return None
     return f"sample_{int(match.group(1))}"
+
+
+def to_numpy_1d_embedding(x) -> np.ndarray:
+    """Convert an embedding-like object into a 1D float32 numpy array."""
+    try:
+        import torch
+
+        if isinstance(x, torch.Tensor):
+            x = x.detach().cpu().float().numpy()
+    except Exception:
+        pass
+
+    arr = np.asarray(x)
+    if arr.ndim == 2 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 1:
+        raise ValueError(f"Expected 1D embedding vector, got shape={arr.shape}")
+    return arr.astype(np.float32)
+
+
+def build_fasta_chrom_map(fasta) -> dict[str, str]:
+    """Map normalized chromosome names to FASTA reference names."""
+    chrom_map: dict[str, str] = {}
+    for ref in fasta.references:
+        chrom = standard_chrom(ref)
+        if chrom is not None and chrom not in chrom_map:
+            chrom_map[chrom] = ref
+    return chrom_map
+
+
+def fetch_window_with_padding(
+    fasta,
+    fasta_chrom: str,
+    start_1based: int,
+    end_1based: int,
+) -> str:
+    """Fetch a 1-based closed interval from FASTA and pad out-of-bound bases with N."""
+    if end_1based < start_1based:
+        return ""
+    ref_len = fasta.get_reference_length(fasta_chrom)
+    left_pad = max(0, 1 - start_1based)
+    right_pad = max(0, end_1based - ref_len)
+    fetch_start = max(1, start_1based)
+    fetch_end = min(ref_len, end_1based)
+    seq = ""
+    if fetch_start <= fetch_end:
+        seq = fasta.fetch(fasta_chrom, fetch_start - 1, fetch_end).upper()
+    return ("N" * left_pad) + seq + ("N" * right_pad)
+
+
+def classify_variant_type(ref: str, alt: str) -> str:
+    """Classify variant type from REF/ALT allele strings."""
+    ref = str(ref).upper()
+    alt = str(alt).upper()
+    if len(ref) == 1 and len(alt) == 1:
+        return "SNV"
+    if len(ref) == len(alt):
+        return "MNV"
+    if len(ref) < len(alt):
+        return "Insertion"
+    if len(ref) > len(alt):
+        return "Deletion"
+    return "Complex"
 
 
 def parse_gff3_attributes(attr_text: str) -> dict[str, str]:

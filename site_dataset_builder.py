@@ -12,12 +12,15 @@ import numpy as np
 import pandas as pd
 
 from utils import (
+    build_fasta_chrom_map,
     extract_gff3_feature_interval_trees,
     extract_gff3_feature_interval_trees_gffutils,
+    fetch_window_with_padding,
     initLogger,
     query_feature_interval_trees,
     standard_chrom,
     standard_sample_name,
+    to_numpy_1d_embedding,
 )
 
 try:
@@ -68,6 +71,9 @@ class SiteDatasetBuilder:
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.cache_dir = self.outdir / "embedding_cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.resume_dir = self.outdir / ".site_dataset_builder_resume"
+        self.resume_dir.mkdir(parents=True, exist_ok=True)
+        self.resume_state_path = self.resume_dir / "resume_state.json"
         self.logger = initLogger(self.outdir / "site_dataset_builder.log")
         self.sample_map: dict[str, str] = {}
         self.sample_list: list[str] = []
@@ -82,6 +88,128 @@ class SiteDatasetBuilder:
             local_files_only=self.local_files_only,
             **self.embedder_kwargs,
         )
+
+    def _stage_cache_path(self, name: str) -> Path:
+        return self.resume_dir / name
+
+    @staticmethod
+    def _file_signature(path_value: str | Path | None) -> dict[str, str | int | None] | None:
+        if path_value is None:
+            return None
+        path = Path(path_value)
+        resolved = path.expanduser().resolve()
+        if not resolved.exists():
+            return {
+                "path": str(resolved),
+                "exists": False,
+                "size": None,
+                "mtime_ns": None,
+            }
+        stat = resolved.stat()
+        return {
+            "path": str(resolved),
+            "exists": True,
+            "size": int(stat.st_size),
+            "mtime_ns": int(stat.st_mtime_ns),
+        }
+
+    def _build_run_signature_payload(self) -> dict[str, object]:
+        input_files = {
+            "gwas_csv_path": self._file_signature(self.gwas_csv_path),
+            "qtl_csv_path": self._file_signature(self.qtl_csv_path),
+            "gff3_path": self._file_signature(self.gff3_path),
+            "fasta_path": self._file_signature(self.fasta_path),
+            "vcf_path": self._file_signature(self.vcf_path),
+            "gene_csv_path": self._file_signature(self.gene_csv_path) if self.gene_csv_path else None,
+            "isolated_sample_csv": self._file_signature(self.isolated_sample_csv) if self.isolated_sample_csv else None,
+        }
+        normalized_config: dict[str, object] = {}
+        for key, value in sorted(self.config.items()):
+            if key.endswith("_path") and value is not None:
+                normalized_config[key] = str(Path(value).expanduser().resolve())
+            else:
+                normalized_config[key] = value
+        return {
+            "config": normalized_config,
+            "input_files": input_files,
+        }
+
+    def _build_run_signature(self) -> tuple[str, dict[str, object]]:
+        payload = self._build_run_signature_payload()
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(text.encode("utf-8")).hexdigest(), payload
+
+    def _load_resume_state(self) -> dict[str, object]:
+        if not self.resume_state_path.exists():
+            return {}
+        try:
+            return json.loads(self.resume_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            self.logger.warning(f"Failed to read resume state: {self.resume_state_path}, will rebuild")
+            return {}
+
+    def _save_resume_state(self, state: dict[str, object]) -> None:
+        self.resume_state_path.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _all_paths_exist(paths: list[str | Path]) -> bool:
+        return all(Path(path).exists() for path in paths)
+
+    def _restore_sample_metadata(self, sample_by_site: pd.DataFrame) -> None:
+        if "sample" not in sample_by_site.columns:
+            raise ValueError("Expected genotype sample matrix to contain 'sample' column")
+        self.sample_list = [str(x) for x in sample_by_site["sample"].tolist()]
+        mapping_path = self.outdir / "sample_name_mapping.csv"
+        if mapping_path.exists():
+            mapping_df = pd.read_csv(mapping_path)
+            if {"raw_sample", "sample"}.issubset(mapping_df.columns):
+                self.sample_map = {
+                    str(raw): str(sample)
+                    for raw, sample in mapping_df[["raw_sample", "sample"]].itertuples(index=False, name=None)
+                }
+
+    def _stage_completed(
+        self,
+        state: dict[str, object],
+        run_signature: str,
+        stage_name: str,
+        expected_paths: list[str | Path],
+    ) -> bool:
+        if state.get("run_signature") != run_signature:
+            return False
+        stages = state.get("stages", {})
+        if not isinstance(stages, dict):
+            return False
+        stage_state = stages.get(stage_name, {})
+        if not isinstance(stage_state, dict):
+            return False
+        if not bool(stage_state.get("completed")):
+            return False
+        return self._all_paths_exist([str(path) for path in expected_paths])
+
+    def _mark_stage_completed(
+        self,
+        state: dict[str, object],
+        run_signature: str,
+        payload: dict[str, object],
+        stage_name: str,
+        output_paths: list[str | Path],
+    ) -> dict[str, object]:
+        new_state = dict(state)
+        new_state["version"] = 1
+        new_state["run_signature"] = run_signature
+        new_state["signature_payload"] = payload
+        stages = dict(new_state.get("stages", {}))
+        stages[stage_name] = {
+            "completed": True,
+            "outputs": [str(path) for path in output_paths],
+        }
+        new_state["stages"] = stages
+        self._save_resume_state(new_state)
+        return new_state
 
     @staticmethod
     def _progress(iterable, **kwargs):
@@ -191,53 +319,14 @@ class SiteDatasetBuilder:
             return (int(digits), str(chrom))
         return (10**9, str(chrom))
 
-    @staticmethod
-    def _to_numpy_1d(x) -> np.ndarray:
-        try:
-            import torch
-
-            if isinstance(x, torch.Tensor):
-                x = x.detach().cpu().float().numpy()
-        except Exception:
-            pass
-        arr = np.asarray(x)
-        if arr.ndim == 2 and arr.shape[0] == 1:
-            arr = arr[0]
-        if arr.ndim != 1:
-            raise ValueError(f"Expected 1D embedding vector, got shape={arr.shape}")
-        return arr.astype(np.float32)
-
     def _embed_sequence(self, seq: str) -> np.ndarray:
         seq_hash = hashlib.sha1(seq.encode("utf-8")).hexdigest()
         cache_path = self.cache_dir / f"{seq_hash}.npy"
         if cache_path.exists():
             return np.load(cache_path)
-        vec = self._to_numpy_1d(self.embedder(seq))
+        vec = to_numpy_1d_embedding(self.embedder(seq))
         np.save(cache_path, vec)
         return vec
-
-    @staticmethod
-    def _build_fasta_chrom_map(fasta) -> dict[str, str]:
-        chrom_map: dict[str, str] = {}
-        for ref in fasta.references:
-            chrom = standard_chrom(ref)
-            if chrom is not None and chrom not in chrom_map:
-                chrom_map[chrom] = ref
-        return chrom_map
-
-    @staticmethod
-    def _fetch_window_with_padding(fasta, fasta_chrom: str, start_1based: int, end_1based: int) -> str:
-        if end_1based < start_1based:
-            return ""
-        ref_len = fasta.get_reference_length(fasta_chrom)
-        left_pad = max(0, 1 - start_1based)
-        right_pad = max(0, end_1based - ref_len)
-        fetch_start = max(1, start_1based)
-        fetch_end = min(ref_len, end_1based)
-        seq = ""
-        if fetch_start <= fetch_end:
-            seq = fasta.fetch(fasta_chrom, fetch_start - 1, fetch_end).upper()
-        return ("N" * left_pad) + seq + ("N" * right_pad)
 
     def _load_gene_filter(self) -> set[str] | None:
         if not self.gene_csv_path:
@@ -383,6 +472,7 @@ class SiteDatasetBuilder:
     def _save_initial_sites(self, site_df: pd.DataFrame) -> Path:
         out_path = self.outdir / "sites_union_or_intersect.csv"
         site_df.loc[:, ["Chromosome", "Position", "qtl_trait", "gwas_trait"]].to_csv(out_path, index=False)
+        site_df.to_csv(self._stage_cache_path("initial_sites.full.csv"), index=False)
         self.logger.info(f"Saved initial sites: {out_path} shape={site_df.shape}")
         return out_path
 
@@ -469,6 +559,7 @@ class SiteDatasetBuilder:
     def _save_gene_sites(self, site_gene_df: pd.DataFrame) -> Path:
         out_path = self.outdir / "sites_in_gene.csv"
         site_gene_df.loc[:, ["Chromosome", "Position", "qtl_trait", "gwas_trait", "gene_id"]].to_csv(out_path, index=False)
+        site_gene_df.to_csv(self._stage_cache_path("gene_sites.full.csv"), index=False)
         self.logger.info(f"Saved gene-mapped sites: {out_path} shape={site_gene_df.shape}")
         return out_path
 
@@ -538,7 +629,7 @@ class SiteDatasetBuilder:
 
         rows: list[dict[str, str | int | float]] = []
         with pysam.FastaFile(str(self.fasta_path)) as fasta:
-            chrom_map = self._build_fasta_chrom_map(fasta)
+            chrom_map = build_fasta_chrom_map(fasta)
             for row in self._progress(
                 site_df.itertuples(index=False),
                 total=len(site_df),
@@ -552,8 +643,8 @@ class SiteDatasetBuilder:
                 ref = str(row.REF).upper()
                 alt = str(row.ALT).upper()
                 pos = int(row.Position)
-                upstream = self._fetch_window_with_padding(fasta, fasta_chrom, pos - self.k, pos - 1)
-                downstream = self._fetch_window_with_padding(
+                upstream = fetch_window_with_padding(fasta, fasta_chrom, pos - self.k, pos - 1)
+                downstream = fetch_window_with_padding(
                     fasta,
                     fasta_chrom,
                     pos + len(ref),
@@ -578,6 +669,7 @@ class SiteDatasetBuilder:
         sample_by_site: pd.DataFrame,
         variant_effect_df: pd.DataFrame,
     ) -> tuple[Path, Path, pd.DataFrame]:
+        variant_effect_df.to_csv(self._stage_cache_path("variant_effect_by_site.csv"), index=False)
         effect_map = dict(zip(variant_effect_df["site_id"], variant_effect_df["var_effect"]))
         matrix = sample_by_site.copy()
         for col in matrix.columns:
@@ -638,7 +730,7 @@ class SiteDatasetBuilder:
         gene_columns: list[str] = []
 
         with pysam.FastaFile(str(self.fasta_path)) as fasta:
-            chrom_map = self._build_fasta_chrom_map(fasta)
+            chrom_map = build_fasta_chrom_map(fasta)
             gene_groups = list(gene_df.groupby("gene_id", sort=True))
             for gene_id, sub_df in self._progress(
                 gene_groups,
@@ -746,48 +838,198 @@ class SiteDatasetBuilder:
 
     def run(self) -> dict[str, str]:
         self.logger.info("Pipeline started")
-        gwas_df = self._read_gwas()
-        qtl_df = self._read_qtl()
-        gwas_site_map = self._build_gwas_site_map(gwas_df)
-        qtl_trees = self._build_qtl_trees(qtl_df)
+        run_signature, signature_payload = self._build_run_signature()
+        state = self._load_resume_state()
+        if state.get("run_signature") == run_signature:
+            self.logger.info(f"Resume signature matched: {run_signature}")
+        elif state:
+            self.logger.info("Resume signature changed, existing cached outputs will not be reused for this run")
+            state = {}
 
-        site_df = self._select_sites_from_vcf(gwas_site_map, qtl_trees)
-        if site_df.empty:
-            raise ValueError("No sites remained after GWAS/QTL filtering")
-        initial_site_path = self._save_initial_sites(site_df)
+        initial_site_output = self.outdir / "sites_union_or_intersect.csv"
+        initial_site_full = self._stage_cache_path("initial_sites.full.csv")
+        if self._stage_completed(state, run_signature, "initial_sites", [initial_site_output, initial_site_full]):
+            self.logger.info(f"Skipping initial site selection, reuse existing outputs: {initial_site_output}")
+            site_df = pd.read_csv(initial_site_full)
+            initial_site_path = initial_site_output
+        else:
+            gwas_df = self._read_gwas()
+            qtl_df = self._read_qtl()
+            gwas_site_map = self._build_gwas_site_map(gwas_df)
+            qtl_trees = self._build_qtl_trees(qtl_df)
+            site_df = self._select_sites_from_vcf(gwas_site_map, qtl_trees)
+            if site_df.empty:
+                raise ValueError("No sites remained after GWAS/QTL filtering")
+            initial_site_path = self._save_initial_sites(site_df)
+            state = self._mark_stage_completed(
+                state,
+                run_signature,
+                signature_payload,
+                "initial_sites",
+                [initial_site_path, initial_site_full],
+            )
 
-        gene_trees = self._build_gene_trees()
-        site_gene_df = self._map_sites_to_genes(site_df, gene_trees)
-        site_gene_df = self._filter_gene_subset(site_gene_df)
-        if site_gene_df.empty:
-            raise ValueError("No sites remained after gene interval filtering")
-        gene_site_path = self._save_gene_sites(site_gene_df)
+        gene_site_output = self.outdir / "sites_in_gene.csv"
+        gene_site_full = self._stage_cache_path("gene_sites.full.csv")
+        if self._stage_completed(state, run_signature, "gene_sites", [gene_site_output, gene_site_full]):
+            self.logger.info(f"Skipping gene mapping, reuse existing outputs: {gene_site_output}")
+            site_gene_df = pd.read_csv(gene_site_full)
+            gene_site_path = gene_site_output
+        else:
+            gene_trees = self._build_gene_trees()
+            site_gene_df = self._map_sites_to_genes(site_df, gene_trees)
+            site_gene_df = self._filter_gene_subset(site_gene_df)
+            if site_gene_df.empty:
+                raise ValueError("No sites remained after gene interval filtering")
+            gene_site_path = self._save_gene_sites(site_gene_df)
+            state = self._mark_stage_completed(
+                state,
+                run_signature,
+                signature_payload,
+                "gene_sites",
+                [gene_site_path, gene_site_full],
+            )
 
-        site_by_sample, sample_by_site = self._extract_genotypes(site_gene_df)
-        genotype_df = sample_by_site.reset_index()
-        unique_site_df = site_gene_df.drop_duplicates(subset=["Chromosome", "Position"]).reset_index(drop=True)
-        variant_effect_df = self._compute_variant_effects(unique_site_df)
-        variant_effect_csv, variant_effect_parquet, variant_effect_matrix_df = self._save_variant_effect_matrix(sample_by_site, variant_effect_df)
-        gene_feature_csv, gene_feature_parquet, gene_feature_df = self._build_gene_feature_matrix(site_gene_df, site_by_sample)
+        genotype_site_by_sample_path = self.outdir / "genotype_012_site_by_sample.csv"
+        genotype_sample_by_site_csv = self.outdir / "genotype_012.csv"
+        genotype_sample_by_site_parquet = self.outdir / "genotype_012.parquet"
+        sample_mapping_path = self.outdir / "sample_name_mapping.csv"
+        if self._stage_completed(
+            state,
+            run_signature,
+            "genotypes",
+            [
+                genotype_site_by_sample_path,
+                genotype_sample_by_site_csv,
+                genotype_sample_by_site_parquet,
+                sample_mapping_path,
+            ],
+        ):
+            self.logger.info(f"Skipping genotype extraction, reuse existing outputs: {genotype_sample_by_site_csv}")
+            site_by_sample = pd.read_csv(genotype_site_by_sample_path)
+            genotype_df = pd.read_csv(genotype_sample_by_site_csv)
+            self._restore_sample_metadata(genotype_df)
+            sample_by_site = genotype_df.set_index("sample")
+        else:
+            site_by_sample, sample_by_site = self._extract_genotypes(site_gene_df)
+            genotype_df = sample_by_site.reset_index()
+            state = self._mark_stage_completed(
+                state,
+                run_signature,
+                signature_payload,
+                "genotypes",
+                [
+                    genotype_site_by_sample_path,
+                    genotype_sample_by_site_csv,
+                    genotype_sample_by_site_parquet,
+                    sample_mapping_path,
+                ],
+            )
+
+        variant_effect_csv = self.outdir / "variant_effect_matrix.csv"
+        variant_effect_parquet = self.outdir / "variant_effect_matrix.parquet"
+        variant_effect_site_cache = self._stage_cache_path("variant_effect_by_site.csv")
+        if self._stage_completed(
+            state,
+            run_signature,
+            "variant_effects",
+            [variant_effect_csv, variant_effect_parquet, variant_effect_site_cache],
+        ):
+            self.logger.info(f"Skipping variant-effect calculation, reuse existing outputs: {variant_effect_csv}")
+            variant_effect_matrix_df = pd.read_csv(variant_effect_csv)
+        else:
+            unique_site_df = site_gene_df.drop_duplicates(subset=["Chromosome", "Position"]).reset_index(drop=True)
+            variant_effect_df = self._compute_variant_effects(unique_site_df)
+            variant_effect_csv, variant_effect_parquet, variant_effect_matrix_df = self._save_variant_effect_matrix(sample_by_site, variant_effect_df)
+            state = self._mark_stage_completed(
+                state,
+                run_signature,
+                signature_payload,
+                "variant_effects",
+                [variant_effect_csv, variant_effect_parquet, variant_effect_site_cache],
+            )
+
+        gene_feature_csv = self.outdir / "gene_sequence_feature_matrix.csv"
+        gene_feature_parquet = self.outdir / "gene_sequence_feature_matrix.parquet"
+        if self._stage_completed(
+            state,
+            run_signature,
+            "gene_features",
+            [gene_feature_csv, gene_feature_parquet],
+        ):
+            self.logger.info(f"Skipping gene feature calculation, reuse existing outputs: {gene_feature_csv}")
+            gene_feature_df = pd.read_csv(gene_feature_csv)
+        else:
+            gene_feature_csv, gene_feature_parquet, gene_feature_df = self._build_gene_feature_matrix(site_gene_df, site_by_sample)
+            state = self._mark_stage_completed(
+                state,
+                run_signature,
+                signature_payload,
+                "gene_features",
+                [gene_feature_csv, gene_feature_parquet],
+            )
 
         outputs = {
             "initial_site_csv": str(initial_site_path),
             "gene_site_csv": str(gene_site_path),
-            "genotype_site_by_sample_csv": str(self.outdir / "genotype_012_site_by_sample.csv"),
-            "genotype_sample_by_site_csv": str(self.outdir / "genotype_012.csv"),
-            "genotype_sample_by_site_parquet": str(self.outdir / "genotype_012.parquet"),
+            "genotype_site_by_sample_csv": str(genotype_site_by_sample_path),
+            "genotype_sample_by_site_csv": str(genotype_sample_by_site_csv),
+            "genotype_sample_by_site_parquet": str(genotype_sample_by_site_parquet),
             "variant_effect_csv": str(variant_effect_csv),
             "variant_effect_parquet": str(variant_effect_parquet),
             "gene_feature_csv": str(gene_feature_csv),
             "gene_feature_parquet": str(gene_feature_parquet),
         }
-        outputs.update(
-            self._split_sample_datasets(
-                genotype_df=genotype_df,
-                variant_effect_df=variant_effect_matrix_df,
-                gene_feature_df=gene_feature_df,
-            )
-        )
+        if self.split_test_ratio is not None:
+            split_outdir = self.outdir / "splits"
+            corrected_split_expected = [
+                split_outdir / "split_meta.json",
+                split_outdir / "train_val_genotype_012.csv",
+                split_outdir / "train_val_genotype_012.parquet",
+                split_outdir / "test_genotype_012.csv",
+                split_outdir / "test_genotype_012.parquet",
+                split_outdir / "train_val_variant_effect_matrix.csv",
+                split_outdir / "train_val_variant_effect_matrix.parquet",
+                split_outdir / "test_variant_effect_matrix.csv",
+                split_outdir / "test_variant_effect_matrix.parquet",
+                split_outdir / "train_val_gene_sequence_feature_matrix.csv",
+                split_outdir / "train_val_gene_sequence_feature_matrix.parquet",
+                split_outdir / "test_gene_sequence_feature_matrix.csv",
+                split_outdir / "test_gene_sequence_feature_matrix.parquet",
+            ]
+            if self._stage_completed(state, run_signature, "splits", corrected_split_expected):
+                self.logger.info(f"Skipping split generation, reuse existing outputs: {split_outdir}")
+                outputs.update(
+                    {
+                        "split_meta_json": str(split_outdir / "split_meta.json"),
+                        "train_val_genotype_csv": str(split_outdir / "train_val_genotype_012.csv"),
+                        "train_val_genotype_parquet": str(split_outdir / "train_val_genotype_012.parquet"),
+                        "test_genotype_csv": str(split_outdir / "test_genotype_012.csv"),
+                        "test_genotype_parquet": str(split_outdir / "test_genotype_012.parquet"),
+                        "train_val_variant_effect_csv": str(split_outdir / "train_val_variant_effect_matrix.csv"),
+                        "train_val_variant_effect_parquet": str(split_outdir / "train_val_variant_effect_matrix.parquet"),
+                        "test_variant_effect_csv": str(split_outdir / "test_variant_effect_matrix.csv"),
+                        "test_variant_effect_parquet": str(split_outdir / "test_variant_effect_matrix.parquet"),
+                        "train_val_gene_feature_csv": str(split_outdir / "train_val_gene_sequence_feature_matrix.csv"),
+                        "train_val_gene_feature_parquet": str(split_outdir / "train_val_gene_sequence_feature_matrix.parquet"),
+                        "test_gene_feature_csv": str(split_outdir / "test_gene_sequence_feature_matrix.csv"),
+                        "test_gene_feature_parquet": str(split_outdir / "test_gene_sequence_feature_matrix.parquet"),
+                    }
+                )
+            else:
+                split_outputs = self._split_sample_datasets(
+                    genotype_df=genotype_df,
+                    variant_effect_df=variant_effect_matrix_df,
+                    gene_feature_df=gene_feature_df,
+                )
+                outputs.update(split_outputs)
+                state = self._mark_stage_completed(
+                    state,
+                    run_signature,
+                    signature_payload,
+                    "splits",
+                    corrected_split_expected,
+                )
         self.logger.info(f"Pipeline finished: {json.dumps(outputs, ensure_ascii=False)}")
         return outputs
 
