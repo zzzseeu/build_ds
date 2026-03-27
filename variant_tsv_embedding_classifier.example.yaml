@@ -1,0 +1,32 @@
+tsv_path: /path/to/sites.tsv
+vcf_path: /path/to/variants.vcf.gz
+fasta_path: /path/to/genome.fa
+outdir: /path/to/variant_tsv_embedding_classifier_out
+
+k: 100
+
+embedder_type: rice8k
+model_name_or_path: /path/to/embedder_model
+device: cuda
+pooling: mean
+local_files_only: true
+
+task_type: auto
+feature_type: alt
+model_type: logistic_regression
+eval_mode: holdout
+test_size: 0.2
+cv_folds: 5
+random_state: 42
+min_class_size: 10
+
+# 可选：仅保留指定类别，多个类别用英文逗号分隔
+selected_classes: null
+
+# 二分类时可选：指定正类名称
+positive_class: null
+
+class_weight: balanced
+
+# 线性模型如 logistic_regression 建议开启
+standardize_features: true

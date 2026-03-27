@@ -82,6 +82,13 @@
 
 ```bash
 python3 /Users/seeu/Desktop/Project/build_ds/variant_tsv_embedding_classifier.py \
+  --config /Users/seeu/Desktop/Project/build_ds/variant_tsv_embedding_classifier.example.yaml
+```
+
+也支持直接命令行传参：
+
+```bash
+python3 /Users/seeu/Desktop/Project/build_ds/variant_tsv_embedding_classifier.py \
   --tsv-path /path/to/sites.tsv \
   --vcf-path /path/to/variants.vcf.gz \
   --fasta-path /path/to/genome.fa \
@@ -108,6 +115,10 @@ python3 /Users/seeu/Desktop/Project/build_ds/variant_tsv_embedding_classifier.py
 - `ref_embeddings.npy`
 - `alt_embeddings.npy`
 - `alt_minus_ref_embeddings.npy`
+
+示例配置文件：
+
+- [variant_tsv_embedding_classifier.example.yaml](/Users/seeu/Desktop/Project/build_ds/variant_tsv_embedding_classifier.example.yaml)
 
 ## 已清理的重复脚本
 

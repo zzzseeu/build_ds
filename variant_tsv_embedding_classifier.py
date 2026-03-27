@@ -627,13 +627,14 @@ def run_cross_validation(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Extract REF/ALT windows from VCF+FASTA for TSV sites and train a VARIANT_TYPE classifier")
-    parser.add_argument("--tsv-path", required=True, help="Input site TSV path; requires Chromosome/Position/VARIANT_TYPE or aliases")
-    parser.add_argument("--vcf-path", required=True, help="Input VCF path")
-    parser.add_argument("--fasta-path", required=True, help="Reference FASTA path")
-    parser.add_argument("--outdir", required=True, help="Output directory")
+    parser.add_argument("--config", default=None, help="YAML config file path")
+    parser.add_argument("--tsv-path", default=None, help="Input site TSV path; requires Chromosome/Position/VARIANT_TYPE or aliases")
+    parser.add_argument("--vcf-path", default=None, help="Input VCF path")
+    parser.add_argument("--fasta-path", default=None, help="Reference FASTA path")
+    parser.add_argument("--outdir", default=None, help="Output directory")
     parser.add_argument("--k", type=int, default=100, help="Upstream/downstream window length")
-    parser.add_argument("--embedder-type", required=True, help="Embedder type, e.g. rice8k")
-    parser.add_argument("--model-name-or-path", required=True, help="Local model path or model name")
+    parser.add_argument("--embedder-type", default=None, help="Embedder type, e.g. rice8k")
+    parser.add_argument("--model-name-or-path", default=None, help="Local model path or model name")
     parser.add_argument("--device", default="cpu", help="Embedding device, e.g. cpu or cuda")
     parser.add_argument("--pooling", default="mean", choices=["mean", "last"], help="Embedding pooling strategy")
     parser.add_argument("--local-files-only", action="store_true", help="Only load model files from local path/cache")
@@ -652,8 +653,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_yaml_config(config_path: str | None) -> dict[str, object]:
+    if not config_path:
+        return {}
+    try:
+        import yaml
+    except Exception as exc:
+        raise ImportError("PyYAML is required to load the config file") from exc
+
+    with Path(config_path).open("r", encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
+
+
+def _resolve_args_with_config(parsed_args) -> argparse.Namespace:
+    config = _load_yaml_config(parsed_args.config)
+    if not isinstance(config, dict):
+        raise ValueError("Config file must contain a YAML mapping/object at top level")
+
+    parser = build_parser()
+    defaults = {
+        action.dest: action.default
+        for action in parser._actions
+        if action.dest != "help"
+    }
+    merged = dict(config)
+    for key, default_value in defaults.items():
+        cli_value = getattr(parsed_args, key, default_value)
+        if cli_value != default_value:
+            merged[key] = cli_value
+        elif key not in merged:
+            merged[key] = default_value
+
+    required = ["tsv_path", "vcf_path", "fasta_path", "outdir", "embedder_type", "model_name_or_path"]
+    missing = [key for key in required if not merged.get(key)]
+    if missing:
+        raise ValueError(f"Missing required parameters after merging config and CLI: {missing}")
+
+    merged["config"] = parsed_args.config
+    return argparse.Namespace(**merged)
+
+
 def main() -> None:
-    args = build_parser().parse_args()
+    args = _resolve_args_with_config(build_parser().parse_args())
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     logger = initLogger(outdir / "variant_tsv_alt_pca.log")
