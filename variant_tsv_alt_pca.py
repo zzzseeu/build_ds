@@ -33,7 +33,9 @@ TSV_COLUMN_ALIASES = {
     "pos": "Position",
     "position": "Position",
     "ref": "REF",
+    "ref_allele": "REF",
     "alt": "ALT",
+    "alt_allele": "ALT",
     "variant_type": "VARIANT_TYPE",
 }
 
