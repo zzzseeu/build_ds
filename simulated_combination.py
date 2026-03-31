@@ -52,6 +52,23 @@ class MutableSite:
         return f"{self.chrom}:{self.pos}"
 
 
+def _format_log_message(message: str, *args: object) -> str:
+    if not args:
+        return message
+    try:
+        return message.format(*args)
+    except Exception:
+        return " ".join([message, *[str(arg) for arg in args]])
+
+
+def log_info(message: str, *args: object) -> None:
+    LOGGER.info(_format_log_message(message, *args))
+
+
+def log_warning(message: str, *args: object) -> None:
+    LOGGER.warning(_format_log_message(message, *args))
+
+
 def parse_scalar_config_value(raw_value: str) -> object:
     value = raw_value.strip()
     if value == "":
@@ -131,14 +148,14 @@ def maybe_write_parquet(rows: list[dict[str, object]], path: Path) -> bool:
     try:
         import pandas as pd  # type: ignore
     except Exception:
-        LOGGER.warning("pandas is not installed, skip parquet output: %s", path)
+        log_warning("pandas is not installed, skip parquet output: {}", path)
         return False
     try:
         pd.DataFrame(rows).to_parquet(path, index=False)
-        LOGGER.info("Wrote parquet: %s rows=%d", path, len(rows))
+        log_info("Wrote parquet: {} rows={}", path, len(rows))
         return True
     except Exception as exc:
-        LOGGER.warning("Failed to write parquet %s: %s", path, exc)
+        log_warning("Failed to write parquet {}: {}", path, exc)
         return False
 
 
@@ -191,6 +208,91 @@ def predict_rows(model, weighted_rows: list[dict[str, object]], site_columns: Se
     except Exception as exc:
         raise RuntimeError(f"Model prediction failed: {exc}") from exc
     return [float(value) for value in predictions]
+
+
+def load_sample_phenotype_rows(
+    phenotype_file: str,
+    sample_name: str,
+) -> tuple[list[dict[str, object]], list[str]]:
+    path = Path(phenotype_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Phenotype file not found: {path}")
+
+    rows = load_csv_rows(path)
+    if not rows:
+        raise ValueError(f"Phenotype file is empty: {path}")
+
+    header = list(rows[0].keys())
+    if len(header) < 3:
+        raise ValueError(
+            "Phenotype file must contain at least three columns: sample, value, and one-hot location feature columns"
+        )
+    if header[0] != "sample" or header[1] != "value":
+        raise ValueError("Phenotype file first two columns must be: sample, value")
+
+    location_columns = header[2:]
+    sample_rows = [row for row in rows if str(row.get("sample", "")).strip() == sample_name]
+    if not sample_rows:
+        raise ValueError(f"Sample '{sample_name}' not found in phenotype file: {path}")
+
+    parsed_rows: list[dict[str, object]] = []
+    for row in sample_rows:
+        parsed_row: dict[str, object] = {
+            "sample": sample_name,
+            "value": float(str(row["value"]).strip()),
+        }
+        for column in location_columns:
+            parsed_row[column] = int(float(str(row.get(column, "0")).strip() or "0"))
+        parsed_rows.append(parsed_row)
+
+    log_info(
+        "Loaded phenotype rows for sample: sample={} rows={} location_features={} source={}",
+        sample_name,
+        len(parsed_rows),
+        len(location_columns),
+        path,
+    )
+    return parsed_rows, location_columns
+
+
+def group_phenotype_rows_by_location(
+    phenotype_rows: list[dict[str, object]],
+    location_columns: Sequence[str],
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[int, ...], list[dict[str, object]]] = {}
+    for row in phenotype_rows:
+        key = tuple(int(row[column]) for column in location_columns)
+        grouped.setdefault(key, []).append(row)
+
+    group_infos: list[dict[str, object]] = []
+    for index, (key, rows) in enumerate(grouped.items(), start=1):
+        location_features = {column: int(value) for column, value in zip(location_columns, key)}
+        active_locations = [column for column, value in location_features.items() if int(value) == 1]
+        location_label = "__".join(active_locations) if active_locations else f"location_group_{index:03d}"
+        mean_value = sum(float(row["value"]) for row in rows) / len(rows)
+        group_infos.append(
+            {
+                "group_id": f"group_{index:03d}",
+                "location_label": location_label,
+                "location_features": location_features,
+                "row_count": len(rows),
+                "actual_value_mean": mean_value,
+                "rows": rows,
+            }
+        )
+    return group_infos
+
+
+def append_location_features(
+    feature_rows: list[dict[str, object]],
+    location_features: dict[str, int],
+) -> list[dict[str, object]]:
+    combined_rows: list[dict[str, object]] = []
+    for row in feature_rows:
+        merged = dict(row)
+        merged.update(location_features)
+        combined_rows.append(merged)
+    return combined_rows
 
 
 def rank_predictions(
@@ -301,7 +403,7 @@ def write_rank_scatter_svg(
 </svg>
 """
     output_path.write_text(svg, encoding="utf-8")
-    LOGGER.info("Wrote ranking scatter SVG: %s", output_path)
+    log_info("Wrote ranking scatter SVG: {}", output_path)
 
 
 def load_single_sample_genotype(genotype_file: str, sample_name: str | None) -> tuple[str, list[str], dict[str, int]]:
@@ -352,8 +454,8 @@ def load_single_sample_genotype(genotype_file: str, sample_name: str | None) -> 
             raise ValueError(f"Genotype value for site {site_id} must be one of {sorted(VALID_GENOTYPES)}")
         genotype_map[site_id] = genotype
 
-    LOGGER.info(
-        "Loaded genotype sample: sample=%s total_sites=%d source=%s",
+    log_info(
+        "Loaded genotype sample: sample={} total_sites={} source={}",
         selected_sample,
         len(site_columns),
         path,
@@ -381,7 +483,7 @@ def load_mutable_sites(mutable_sites_file: str) -> list[MutableSite]:
             raise ValueError(f"Duplicate mutable site detected: {site.site_id}")
         seen.add(site.site_id)
         sites.append(site)
-    LOGGER.info("Loaded mutable sites: count=%d source=%s", len(sites), path)
+    log_info("Loaded mutable sites: count={} source={}", len(sites), path)
     return sites
 
 
@@ -426,7 +528,7 @@ def load_variant_effects(variant_effect_file: str, site_columns: Sequence[str]) 
             + ",".join(missing_effects[:20])
             + ("..." if len(missing_effects) > 20 else "")
         )
-    LOGGER.info("Loaded variant effects: count=%d source=%s", len(effect_map), path)
+    log_info("Loaded variant effects: count={} source={}", len(effect_map), path)
     return effect_map
 
 
@@ -459,8 +561,8 @@ def build_simulated_rows(
     mutable_site_ids = [site.site_id for site in mutable_sites]
     mutable_value_choices = [alternative_genotypes(genotype_map[site_id]) for site_id in mutable_site_ids]
     total_samples = 2 ** len(mutable_site_ids)
-    LOGGER.info(
-        "Enumerating simulated combinations: mutable_sites=%d total_simulated_samples=%d",
+    log_info(
+        "Enumerating simulated combinations: mutable_sites={} total_simulated_samples={}",
         len(mutable_site_ids),
         total_samples,
     )
@@ -519,18 +621,18 @@ def save_outputs(
     genotype_fields = ["sample"] + list(site_columns)
     write_csv(genotype_rows, genotype_csv, genotype_fields)
     genotype_parquet_ok = maybe_write_parquet(genotype_rows, genotype_parquet)
-    LOGGER.info("Wrote simulated genotype matrix: %s rows=%d", genotype_csv, len(genotype_rows))
+    log_info("Wrote simulated genotype matrix: {} rows={}", genotype_csv, len(genotype_rows))
 
     write_csv(weighted_rows, weighted_csv, genotype_fields)
     weighted_parquet_ok = maybe_write_parquet(weighted_rows, weighted_parquet)
-    LOGGER.info("Wrote simulated weighted matrix: %s rows=%d", weighted_csv, len(weighted_rows))
+    log_info("Wrote simulated weighted matrix: {} rows={}", weighted_csv, len(weighted_rows))
 
     write_csv(
         metadata_rows,
         metadata_csv,
         ["sample", "source_sample", "mutable_site_count", "mutation_path"],
     )
-    LOGGER.info("Wrote simulation metadata: %s rows=%d", metadata_csv, len(metadata_rows))
+    log_info("Wrote simulation metadata: {} rows={}", metadata_csv, len(metadata_rows))
 
     summary = {
         "source_sample": original_sample,
@@ -547,24 +649,25 @@ def save_outputs(
         },
     }
     metadata_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    LOGGER.info("Wrote simulation summary: %s", metadata_json)
+    log_info("Wrote simulation summary: {}", metadata_json)
     return summary
 
 
 def write_summary_json(summary: dict[str, object]) -> None:
     summary_path = Path(str(summary["summary_json"]))
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    LOGGER.info("Updated simulation summary: %s", summary_path)
+    log_info("Updated simulation summary: {}", summary_path)
 
 
 def save_prediction_outputs(
     outdir: Path,
     ranking_rows: list[dict[str, object]],
     rank_sample: str,
+    file_prefix: str = "simulated_prediction_ranking",
 ) -> dict[str, object]:
-    prediction_csv = outdir / "simulated_prediction_ranking.csv"
-    prediction_parquet = outdir / "simulated_prediction_ranking.parquet"
-    scatter_svg = outdir / "simulated_prediction_ranking.svg"
+    prediction_csv = outdir / f"{file_prefix}.csv"
+    prediction_parquet = outdir / f"{file_prefix}.parquet"
+    scatter_svg = outdir / f"{file_prefix}.svg"
 
     fields = ["sample", "predicted_phenotype", "rank", "is_target"]
     write_csv(ranking_rows, prediction_csv, fields)
@@ -572,8 +675,8 @@ def save_prediction_outputs(
     write_rank_scatter_svg(ranking_rows, rank_sample, scatter_svg)
 
     target_row = next(row for row in ranking_rows if bool(row["is_target"]))
-    LOGGER.info(
-        "Saved prediction ranking: sample=%s rank=%s predicted_phenotype=%.6f",
+    log_info(
+        "Saved prediction ranking: sample={} rank={} predicted_phenotype={:.6f}",
         rank_sample,
         target_row["rank"],
         float(target_row["predicted_phenotype"]),
@@ -611,6 +714,7 @@ def main() -> None:
     outdir = Path(str(config.get("outdir", "simulated_combination_outputs")))
     sample_name = config.get("sample_name")
     model_file = config.get("model_file")
+    phenotype_file = config.get("phenotype_file")
     rank_order = str(config.get("rank_order", "desc")).lower()
     log_level = str(config.get("log_level", "INFO")).upper()
 
@@ -618,7 +722,7 @@ def main() -> None:
         raise ValueError("rank_order must be one of: desc, asc")
 
     LOGGER = get_logger(outdir / "simulated_combination.log", level=log_level)
-    LOGGER.info("Loaded config: %s", args.config)
+    log_info("Loaded config: {}", args.config)
 
     original_sample, site_columns, genotype_map = load_single_sample_genotype(
         genotype_file=genotype_file,
@@ -652,22 +756,65 @@ def main() -> None:
             genotype_map=genotype_map,
             effect_map=effect_map,
         )
-        prediction_weighted_rows = [original_weighted_row] + weighted_rows
         model = load_model(str(model_file))
-        predictions = predict_rows(model, prediction_weighted_rows, site_columns)
-        ranking_rows = rank_predictions(
-            weighted_rows=prediction_weighted_rows,
-            predictions=predictions,
-            rank_sample=original_sample,
-            descending=(rank_order == "desc"),
-        )
-        summary["prediction"] = save_prediction_outputs(
-            outdir=outdir,
-            ranking_rows=ranking_rows,
-            rank_sample=original_sample,
-        )
-        summary["prediction"]["rank_target"] = "original_sample"
-        summary["prediction"]["original_sample_included"] = True
+        prediction_weighted_rows = [original_weighted_row] + weighted_rows
+
+        if phenotype_file not in {None, ""}:
+            phenotype_rows, location_columns = load_sample_phenotype_rows(
+                phenotype_file=str(phenotype_file),
+                sample_name=original_sample,
+            )
+            location_groups = group_phenotype_rows_by_location(phenotype_rows, location_columns)
+            prediction_groups: list[dict[str, object]] = []
+            for group in location_groups:
+                location_dir = outdir / "prediction_by_location" / str(group["group_id"])
+                location_dir.mkdir(parents=True, exist_ok=True)
+                combined_weighted_rows = append_location_features(
+                    prediction_weighted_rows,
+                    group["location_features"],
+                )
+                full_feature_columns = list(site_columns) + list(location_columns)
+                predictions = predict_rows(model, combined_weighted_rows, full_feature_columns)
+                ranking_rows = rank_predictions(
+                    weighted_rows=combined_weighted_rows,
+                    predictions=predictions,
+                    rank_sample=original_sample,
+                    descending=(rank_order == "desc"),
+                )
+                group_output = save_prediction_outputs(
+                    outdir=location_dir,
+                    ranking_rows=ranking_rows,
+                    rank_sample=original_sample,
+                    file_prefix=f"simulated_prediction_ranking_{group['group_id']}",
+                )
+                group_output["rank_target"] = "original_sample"
+                group_output["original_sample_included"] = True
+                group_output["group_id"] = group["group_id"]
+                group_output["location_label"] = group["location_label"]
+                group_output["row_count"] = int(group["row_count"])
+                group_output["actual_value_mean"] = float(group["actual_value_mean"])
+                group_output["location_features"] = group["location_features"]
+                prediction_groups.append(group_output)
+            summary["prediction"] = {
+                "mode": "grouped_by_location",
+                "location_feature_columns": location_columns,
+                "groups": prediction_groups,
+            }
+        else:
+            predictions = predict_rows(model, prediction_weighted_rows, site_columns)
+            ranking_rows = rank_predictions(
+                weighted_rows=prediction_weighted_rows,
+                predictions=predictions,
+                rank_sample=original_sample,
+                descending=(rank_order == "desc"),
+            )
+            summary["prediction"] = save_prediction_outputs(
+                outdir=outdir,
+                ranking_rows=ranking_rows,
+                rank_sample=original_sample,
+            )
+            summary["prediction"]["rank_target"] = "original_sample"
+            summary["prediction"]["original_sample_included"] = True
 
     write_summary_json(summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
