@@ -13,7 +13,7 @@ Inputs:
 3. Variant-effect CSV:
    - first column ``Chromosome``
    - second column ``Position``
-   - last column ``variant_effect``
+   - last column ``var_effect``
 
 For each mutable site, the script enumerates the two genotype values different
 from the original genotype. If the original genotype is 0, the mutated values
@@ -407,17 +407,17 @@ def load_variant_effects(variant_effect_file: str, site_columns: Sequence[str]) 
     header = list(rows[0].keys())
     if len(header) < 3:
         raise ValueError(
-            "Variant-effect file must contain at least three columns: Chromosome, Position, ..., variant_effect"
+            "Variant-effect file must contain at least three columns: Chromosome, Position, ..., var_effect"
         )
-    if header[0] != "Chromosome" or header[1] != "Position" or header[-1] != "variant_effect":
+    if header[0] != "Chromosome" or header[1] != "Position" or header[-1] != "var_effect":
         raise ValueError(
-            "Variant-effect file format must be: first column Chromosome, second column Position, last column variant_effect"
+            "Variant-effect file format must be: first column Chromosome, second column Position, last column var_effect"
         )
 
     effect_map: dict[str, float] = {}
     for row in rows:
         site_id = f"{str(row['Chromosome']).strip()}:{int(str(row['Position']).strip())}"
-        effect_map[site_id] = float(str(row["variant_effect"]).strip())
+        effect_map[site_id] = float(str(row["var_effect"]).strip())
 
     missing_effects = [site_id for site_id in site_columns if site_id not in effect_map]
     if missing_effects:
