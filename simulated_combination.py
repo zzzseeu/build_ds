@@ -21,7 +21,6 @@ import json
 import math
 import pickle
 import re
-from itertools import product
 from pathlib import Path
 from typing import Sequence
 
@@ -362,37 +361,42 @@ def group_filtered_rows_by_location(filtered_df: pd.DataFrame, location_columns:
 def build_combination_frame(
     base_row: pd.Series,
     sample_id: str,
-    location_columns: Sequence[str],
     genotype_feature_columns: Sequence[str],
     mutable_features: Sequence[str],
     effect_map: dict[str, float],
 ) -> pd.DataFrame:
     mutable_features = list(mutable_features)
     mutable_feature_set = set(mutable_features)
-    non_mutable_features = [column for column in genotype_feature_columns if column not in mutable_feature_set]
+    mutable_feature_index = {feature: idx for idx, feature in enumerate(mutable_features)}
+    genotype_feature_columns = list(genotype_feature_columns)
     total_combinations = len(VALID_GENOTYPES) ** len(mutable_features)
     if total_combinations <= 0:
         raise ValueError("No combinations generated for mutable features")
 
-    genotype_data: dict[str, np.ndarray] = {}
-    for column in non_mutable_features:
-        genotype_data[column] = np.full(total_combinations, int(base_row[column]), dtype=np.int8)
+    weighted_matrix = np.empty((total_combinations, len(genotype_feature_columns)), dtype=np.float32)
+    target_index = 0
+    mutable_count = len(mutable_features)
 
-    if mutable_features:
-        combos = np.asarray(list(product(VALID_GENOTYPES, repeat=len(mutable_features))), dtype=np.int8)
-        for idx, column in enumerate(mutable_features):
-            genotype_data[column] = combos[:, idx]
-        original_signature = np.asarray([int(base_row[column]) for column in mutable_features], dtype=np.int8)
-        target_mask = np.all(combos == original_signature, axis=1)
-    else:
-        target_mask = np.asarray([True], dtype=bool)
+    for column_index, column in enumerate(genotype_feature_columns):
+        effect = np.float32(effect_map[column])
+        if column in mutable_feature_set:
+            mutable_index = mutable_feature_index[column]
+            repeat_each = 3 ** (mutable_count - mutable_index - 1)
+            tile_count = 3 ** mutable_index
+            genotype_pattern = np.tile(np.repeat(np.asarray(VALID_GENOTYPES, dtype=np.int8), repeat_each), tile_count)
+            weighted_matrix[:, column_index] = genotype_pattern.astype(np.float32) * effect
+            target_index += int(base_row[column]) * (3 ** (mutable_count - mutable_index - 1))
+        else:
+            weighted_matrix[:, column_index] = np.float32(base_row[column]) * effect
 
-    if int(target_mask.sum()) != 1:
-        raise ValueError("Expected exactly one original genotype combination in the simulated combination set")
+    if target_index < 0 or target_index >= total_combinations:
+        raise ValueError("Original genotype combination index is out of bounds")
+
+    target_mask = np.zeros(total_combinations, dtype=bool)
+    target_mask[target_index] = True
 
     combo_ids = [f"sim_{idx:06d}" for idx in range(total_combinations)]
     samples = [f"{sample_id}_sim_{idx:06d}" for idx in range(total_combinations)]
-    target_index = int(np.flatnonzero(target_mask)[0])
     combo_ids[target_index] = "original"
     samples[target_index] = str(sample_id)
 
@@ -402,12 +406,19 @@ def build_combination_frame(
         "is_target": target_mask.astype(bool),
         "source_sample": [str(sample_id)] * total_combinations,
     })
-    for column in location_columns:
-        feature_df[column] = int(base_row[column])
-    for column in genotype_feature_columns:
-        effect = float(effect_map[column])
-        feature_df[column] = np.asarray(genotype_data[column], dtype=np.float32) * effect
+    genotype_feature_df = pd.DataFrame(weighted_matrix, columns=genotype_feature_columns, copy=False)
+    feature_df = pd.concat([feature_df, genotype_feature_df], axis=1)
     return feature_df
+
+
+def append_location_features(
+    simulated_feature_df: pd.DataFrame,
+    location_features: dict[str, int],
+) -> pd.DataFrame:
+    prediction_df = simulated_feature_df.copy()
+    for column, value in location_features.items():
+        prediction_df[column] = int(value)
+    return prediction_df
 
 
 def rank_predictions(
@@ -514,7 +525,7 @@ def save_group_outputs(
     outdir: Path,
     group_id: str,
     merged_group_df: pd.DataFrame,
-    simulated_feature_df: pd.DataFrame,
+    prediction_feature_df: pd.DataFrame,
     ranking_df: pd.DataFrame,
     target_sample: str,
 ) -> dict[str, object]:
@@ -522,16 +533,16 @@ def save_group_outputs(
 
     merged_csv = outdir / f"merged_pheno_geno_{group_id}.csv"
     merged_parquet = outdir / f"merged_pheno_geno_{group_id}.parquet"
-    simulated_csv = outdir / f"simulated_weighted_features_{group_id}.csv"
-    simulated_parquet = outdir / f"simulated_weighted_features_{group_id}.parquet"
+    prediction_feature_csv = outdir / f"prediction_features_{group_id}.csv"
+    prediction_feature_parquet = outdir / f"prediction_features_{group_id}.parquet"
     ranking_csv = outdir / f"simulated_prediction_ranking_{group_id}.csv"
     ranking_parquet = outdir / f"simulated_prediction_ranking_{group_id}.parquet"
     scatter_svg = outdir / f"simulated_prediction_ranking_{group_id}.svg"
 
     merged_group_df.to_csv(merged_csv, index=False)
     merged_parquet_ok = maybe_write_parquet(merged_group_df, merged_parquet)
-    simulated_feature_df.to_csv(simulated_csv, index=False)
-    simulated_parquet_ok = maybe_write_parquet(simulated_feature_df, simulated_parquet)
+    prediction_feature_df.to_csv(prediction_feature_csv, index=False)
+    prediction_feature_parquet_ok = maybe_write_parquet(prediction_feature_df, prediction_feature_parquet)
     ranking_df.to_csv(ranking_csv, index=False)
     ranking_parquet_ok = maybe_write_parquet(ranking_df, ranking_parquet)
     write_rank_scatter_svg(ranking_df, target_sample, scatter_svg)
@@ -541,8 +552,8 @@ def save_group_outputs(
         "group_id": group_id,
         "merged_pheno_geno_csv": str(merged_csv),
         "merged_pheno_geno_parquet": str(merged_parquet) if merged_parquet_ok else None,
-        "simulated_feature_csv": str(simulated_csv),
-        "simulated_feature_parquet": str(simulated_parquet) if simulated_parquet_ok else None,
+        "prediction_feature_csv": str(prediction_feature_csv),
+        "prediction_feature_parquet": str(prediction_feature_parquet) if prediction_feature_parquet_ok else None,
         "prediction_ranking_csv": str(ranking_csv),
         "prediction_ranking_parquet": str(ranking_parquet) if ranking_parquet_ok else None,
         "prediction_ranking_svg": str(scatter_svg),
@@ -610,6 +621,8 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
     merged_sample_csv = outdir / "merged_pheno_geno_filtered.csv"
     merged_sample_parquet = outdir / "merged_pheno_geno_filtered.parquet"
+    simulated_feature_csv = outdir / "simulated_weighted_features.csv"
+    simulated_feature_parquet = outdir / "simulated_weighted_features.parquet"
     merged_sample_df.to_csv(merged_sample_csv, index=False)
     merged_sample_parquet_ok = maybe_write_parquet(merged_sample_df, merged_sample_parquet)
 
@@ -617,20 +630,25 @@ def main() -> None:
     feature_columns_for_prediction = list(location_columns) + list(genotype_feature_columns)
     descending = rank_order == "desc"
     total_combinations = len(VALID_GENOTYPES) ** len(mutable_features)
+    base_row = merged_sample_df.iloc[0]
+    simulated_feature_df = build_combination_frame(
+        base_row=base_row,
+        sample_id=sample_id,
+        genotype_feature_columns=genotype_feature_columns,
+        mutable_features=mutable_features,
+        effect_map=effect_map,
+    )
+    simulated_feature_df.to_csv(simulated_feature_csv, index=False)
+    simulated_feature_parquet_ok = maybe_write_parquet(simulated_feature_df, simulated_feature_parquet)
 
     for group in location_groups:
         group_id = str(group["group_id"])
         group_df = pd.DataFrame(group["group_df"])
-        base_row = group_df.iloc[0]
-        simulation_feature_df = build_combination_frame(
-            base_row=base_row,
-            sample_id=sample_id,
-            location_columns=location_columns,
-            genotype_feature_columns=genotype_feature_columns,
-            mutable_features=mutable_features,
-            effect_map=effect_map,
+        prediction_df = append_location_features(
+            simulated_feature_df=simulated_feature_df,
+            location_features=dict(group["location_features"]),
         )
-        prediction_df = simulation_feature_df.loc[:, ["sample", "combination_id", "is_target", "source_sample"] + feature_columns_for_prediction]
+        prediction_df = prediction_df.loc[:, ["sample", "combination_id", "is_target", "source_sample"] + feature_columns_for_prediction]
         predictions = predict_frame(model, prediction_df, feature_columns_for_prediction)
         ranking_df = rank_predictions(prediction_df, predictions, descending=descending)
 
@@ -639,7 +657,7 @@ def main() -> None:
             outdir=group_outdir,
             group_id=group_id,
             merged_group_df=group_df,
-            simulated_feature_df=simulation_feature_df,
+            prediction_feature_df=prediction_df,
             ranking_df=ranking_df,
             target_sample=sample_id,
         )
@@ -661,6 +679,8 @@ def main() -> None:
         "files": {
             "merged_pheno_geno_filtered_csv": str(merged_sample_csv),
             "merged_pheno_geno_filtered_parquet": str(merged_sample_parquet) if merged_sample_parquet_ok else None,
+            "simulated_feature_csv": str(simulated_feature_csv),
+            "simulated_feature_parquet": str(simulated_feature_parquet) if simulated_feature_parquet_ok else None,
         },
         "prediction": {
             "mode": "grouped_by_location",
