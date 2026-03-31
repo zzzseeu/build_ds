@@ -62,11 +62,13 @@ def _format_log_message(message: str, *args: object) -> str:
 
 
 def log_info(message: str, *args: object) -> None:
-    LOGGER.info(_format_log_message(message, *args))
+    if LOGGER is not None:
+        LOGGER.info(_format_log_message(message, *args))
 
 
 def log_warning(message: str, *args: object) -> None:
-    LOGGER.warning(_format_log_message(message, *args))
+    if LOGGER is not None:
+        LOGGER.warning(_format_log_message(message, *args))
 
 
 def parse_scalar_config_value(raw_value: str) -> object:
@@ -570,6 +572,7 @@ def build_simulated_rows(
     genotype_rows: list[dict[str, object]] = []
     weighted_rows: list[dict[str, object]] = []
     metadata_rows: list[dict[str, object]] = []
+    genotype_signatures: set[tuple[int, ...]] = set()
 
     for combo_index, combo_values in enumerate(product(*mutable_value_choices), start=1):
         sample_id = f"{original_sample}_sim_{combo_index:06d}"
@@ -588,15 +591,29 @@ def build_simulated_rows(
         )
         genotype_rows.append(genotype_row)
         weighted_rows.append(weighted_row)
+        genotype_signature = tuple(int(genotype_row[site_id]) for site_id in site_columns)
+        genotype_signatures.add(genotype_signature)
         metadata_rows.append(
             {
                 "sample": sample_id,
                 "source_sample": original_sample,
                 "mutable_site_count": len(mutable_site_ids),
+                "mutated_sites": ";".join(mutable_site_ids),
+                "genotype_signature": "|".join(str(int(genotype_row[site_id])) for site_id in site_columns),
                 "mutation_path": ";".join(mutation_desc_parts),
             }
         )
 
+    if mutable_site_ids and len(genotype_signatures) <= 1:
+        raise ValueError(
+            "Simulation produced only one unique genotype although mutable sites were provided. "
+            "Please check genotype_file column names and mutable_sites_file entries."
+        )
+    log_info(
+        "Simulated genotype uniqueness check: unique_genotypes={} total_rows={}",
+        len(genotype_signatures),
+        len(genotype_rows),
+    )
     return genotype_rows, weighted_rows, metadata_rows
 
 
@@ -630,7 +647,7 @@ def save_outputs(
     write_csv(
         metadata_rows,
         metadata_csv,
-        ["sample", "source_sample", "mutable_site_count", "mutation_path"],
+        ["sample", "source_sample", "mutable_site_count", "mutated_sites", "genotype_signature", "mutation_path"],
     )
     log_info("Wrote simulation metadata: {} rows={}", metadata_csv, len(metadata_rows))
 
