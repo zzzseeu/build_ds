@@ -22,6 +22,7 @@ are 1 and 2. Therefore, N mutable sites produce 2^N simulated samples.
 from __future__ import annotations
 
 import argparse
+import ast
 import csv
 import json
 import math
@@ -46,6 +47,65 @@ class MutableSite:
     @property
     def site_id(self) -> str:
         return f"{self.chrom}:{self.pos}"
+
+
+def parse_scalar_config_value(raw_value: str) -> object:
+    value = raw_value.strip()
+    if value == "":
+        return ""
+    lower = value.lower()
+    if lower in {"null", "none"}:
+        return None
+    if lower == "true":
+        return True
+    if lower == "false":
+        return False
+    try:
+        return ast.literal_eval(value)
+    except Exception:
+        return value.strip("'\"")
+
+
+def load_yaml_config(config_file: str) -> dict[str, object]:
+    path = Path(config_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        yaml = None
+
+    if yaml is not None:
+        with path.open("r", encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        if not isinstance(data, dict):
+            raise ValueError(f"YAML config must be a key-value mapping: {path}")
+        return {str(key): value for key, value in data.items()}
+
+    config: dict[str, object] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                raise ValueError(
+                    f"Unsupported YAML format at {path}:{line_no}. "
+                    "Without PyYAML installed, only simple 'key: value' lines are supported."
+                )
+            key, value = line.split(":", 1)
+            key = key.strip()
+            if not key:
+                raise ValueError(f"Empty config key at {path}:{line_no}")
+            config[key] = parse_scalar_config_value(value)
+    return config
+
+
+def require_config_value(config: dict[str, object], key: str) -> object:
+    if key not in config or config[key] in {None, ""}:
+        raise ValueError(f"Missing required config field: {key}")
+    return config[key]
 
 
 def load_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -509,51 +569,9 @@ def parse_args() -> argparse.Namespace:
         description="Enumerate all genotype combinations by mutating selected sites of one sample."
     )
     parser.add_argument(
-        "--genotype-file",
+        "--config",
         required=True,
-        help="Input genotype matrix CSV. First column must be sample, remaining columns are site ids.",
-    )
-    parser.add_argument(
-        "--mutable-sites-file",
-        required=True,
-        help="CSV containing mutable sites. Required columns: Chromosome, Position.",
-    )
-    parser.add_argument(
-        "--variant-effect-file",
-        required=True,
-        help="Variant-effect CSV with either [site_id,var_effect] or [Chromosome,Position,var_effect].",
-    )
-    parser.add_argument(
-        "--sample-name",
-        default=None,
-        help="Sample name to simulate. Required only when genotype file contains multiple samples.",
-    )
-    parser.add_argument(
-        "--outdir",
-        default="simulated_combination_outputs",
-        help="Output directory.",
-    )
-    parser.add_argument(
-        "--model-file",
-        default=None,
-        help="Optional phenotype prediction model file from model_train output.",
-    )
-    parser.add_argument(
-        "--rank-sample",
-        default=None,
-        help="Sample id to highlight in prediction ranking. Required when --model-file is provided.",
-    )
-    parser.add_argument(
-        "--rank-order",
-        default="desc",
-        choices=["desc", "asc"],
-        help="Sort direction for phenotype ranking. desc means larger predicted phenotype gets smaller rank.",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Logging level.",
+        help="YAML config file path.",
     )
     return parser.parse_args()
 
@@ -561,16 +579,31 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     global LOGGER
     args = parse_args()
-    outdir = Path(args.outdir)
-    LOGGER = get_logger(outdir / "simulated_combination.log", level=args.log_level)
+    config = load_yaml_config(args.config)
+
+    genotype_file = str(require_config_value(config, "genotype_file"))
+    mutable_sites_file = str(require_config_value(config, "mutable_sites_file"))
+    variant_effect_file = str(require_config_value(config, "variant_effect_file"))
+    outdir = Path(str(config.get("outdir", "simulated_combination_outputs")))
+    sample_name = config.get("sample_name")
+    model_file = config.get("model_file")
+    rank_sample = config.get("rank_sample")
+    rank_order = str(config.get("rank_order", "desc")).lower()
+    log_level = str(config.get("log_level", "INFO")).upper()
+
+    if rank_order not in {"desc", "asc"}:
+        raise ValueError("rank_order must be one of: desc, asc")
+
+    LOGGER = get_logger(outdir / "simulated_combination.log", level=log_level)
+    LOGGER.info("Loaded config: %s", args.config)
 
     original_sample, site_columns, genotype_map = load_single_sample_genotype(
-        genotype_file=args.genotype_file,
-        sample_name=args.sample_name,
+        genotype_file=genotype_file,
+        sample_name=None if sample_name in {None, ""} else str(sample_name),
     )
-    mutable_sites = load_mutable_sites(args.mutable_sites_file)
+    mutable_sites = load_mutable_sites(mutable_sites_file)
     validate_mutable_sites_in_genotype(site_columns, mutable_sites)
-    effect_map = load_variant_effects(args.variant_effect_file, site_columns)
+    effect_map = load_variant_effects(variant_effect_file, site_columns)
 
     genotype_rows, weighted_rows, metadata_rows = build_simulated_rows(
         original_sample=original_sample,
@@ -589,21 +622,21 @@ def main() -> None:
         mutable_sites=mutable_sites,
     )
 
-    if args.model_file:
-        if not args.rank_sample:
-            raise ValueError("--rank-sample is required when --model-file is provided")
-        model = load_model(args.model_file)
+    if model_file not in {None, ""}:
+        if rank_sample in {None, ""}:
+            raise ValueError("rank_sample is required in config when model_file is provided")
+        model = load_model(str(model_file))
         predictions = predict_rows(model, weighted_rows, site_columns)
         ranking_rows = rank_predictions(
             weighted_rows=weighted_rows,
             predictions=predictions,
-            rank_sample=args.rank_sample,
-            descending=(args.rank_order == "desc"),
+            rank_sample=str(rank_sample),
+            descending=(rank_order == "desc"),
         )
         summary["prediction"] = save_prediction_outputs(
             outdir=outdir,
             ranking_rows=ranking_rows,
-            rank_sample=args.rank_sample,
+            rank_sample=str(rank_sample),
         )
 
     write_summary_json(summary)
