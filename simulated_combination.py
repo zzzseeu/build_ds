@@ -1,55 +1,39 @@
 #!/usr/bin/env python3
-"""Enumerate all simulated genotype combinations from one sample genotype matrix.
+"""Simulate genotype-feature combinations for one sample across location groups.
 
-Inputs:
-1. Genotype matrix CSV:
-   - rows are samples
-   - first column must be ``sample``
-   - remaining columns are site ids such as ``Chr1:12345``
-   - values must be genotype codes in {0, 1, 2}
-2. Mutable-site CSV:
-   - first column ``Chromosome``
-   - second column ``Position``
-3. Variant-effect CSV:
-   - first column ``Chromosome``
-   - second column ``Position``
-   - last column ``var_effect``
-
-For each mutable site, the script enumerates the two genotype values different
-from the original genotype. If the original genotype is 0, the mutated values
-are 1 and 2. Therefore, N mutable sites produce 2^N simulated samples.
+Workflow:
+1. Read genotype and phenotype matrices with pandas.
+2. Merge phenotype columns on the left and genotype columns on the right by ``sample``.
+3. Keep only rows for the requested ``sample_id``.
+4. Read ``feature_importance.csv`` and select the top-N non-location genotype features.
+5. For each location group of the selected sample, enumerate all genotype combinations
+   for mutable features using values in {0, 1, 2}.
+6. Convert genotype features to weighted variant-effect features via ``var_effect``.
+7. Predict phenotype values with the provided model, rank all combinations, and
+   generate scatter plots highlighting the original sample combination.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
-import csv
 import json
 import math
 import pickle
 import re
-from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
 from typing import Sequence
+
+import numpy as np
+import pandas as pd
 
 from utils import get_logger
 
 
 LOGGER = None
-VALID_GENOTYPES = {0, 1, 2}
+VALID_GENOTYPES = (0, 1, 2)
 SITE_ID_PATTERN = re.compile(r"^Chr\d+:\d+$")
-
-
-@dataclass(frozen=True)
-class MutableSite:
-    chrom: str
-    pos: int
-
-    @property
-    def site_id(self) -> str:
-        return f"{self.chrom}:{self.pos}"
 
 
 def _format_log_message(message: str, *args: object) -> str:
@@ -130,31 +114,10 @@ def require_config_value(config: dict[str, object], key: str) -> object:
     return config[key]
 
 
-def load_csv_rows(path: Path) -> list[dict[str, str]]:
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames is None:
-            raise ValueError(f"CSV has no header: {path}")
-        rows = [{str(k): str(v).strip() for k, v in row.items() if k is not None} for row in reader]
-    return rows
-
-
-def write_csv(rows: list[dict[str, object]], path: Path, fieldnames: Sequence[str]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(fieldnames))
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def maybe_write_parquet(rows: list[dict[str, object]], path: Path) -> bool:
+def maybe_write_parquet(df: pd.DataFrame, path: Path) -> bool:
     try:
-        import pandas as pd  # type: ignore
-    except Exception:
-        log_warning("pandas is not installed, skip parquet output: {}", path)
-        return False
-    try:
-        pd.DataFrame(rows).to_parquet(path, index=False)
-        log_info("Wrote parquet: {} rows={}", path, len(rows))
+        df.to_parquet(path, index=False)
+        log_info("Wrote parquet: {} rows={}", path, len(df))
         return True
     except Exception as exc:
         log_warning("Failed to write parquet {}: {}", path, exc)
@@ -187,138 +150,276 @@ def load_model(model_file: str):
     raise ValueError(f"Unsupported model object in file: {path}")
 
 
-def get_model_feature_order(model, site_columns: Sequence[str]) -> list[str]:
+def get_model_feature_order(model, feature_columns: Sequence[str]) -> list[str]:
     feature_names = getattr(model, "feature_names_in_", None)
     if feature_names is None:
-        return list(site_columns)
+        return list(feature_columns)
     return [str(name) for name in feature_names]
 
 
-def predict_rows(model, weighted_rows: list[dict[str, object]], site_columns: Sequence[str]) -> list[float]:
-    feature_order = get_model_feature_order(model, site_columns)
-    missing = [feature for feature in feature_order if feature not in site_columns]
+def predict_frame(model, feature_df: pd.DataFrame, feature_columns: Sequence[str]) -> np.ndarray:
+    feature_order = get_model_feature_order(model, feature_columns)
+    missing = [feature for feature in feature_order if feature not in feature_df.columns]
     if missing:
         raise ValueError(
-            "Model expects features missing from simulated matrix: "
+            "Model expects features missing from prediction matrix: "
             + ",".join(missing[:20])
             + ("..." if len(missing) > 20 else "")
         )
-
-    matrix = [[float(row[feature]) for feature in feature_order] for row in weighted_rows]
+    matrix = feature_df.loc[:, feature_order]
     try:
         predictions = model.predict(matrix)
     except Exception as exc:
         raise RuntimeError(f"Model prediction failed: {exc}") from exc
-    return [float(value) for value in predictions]
+    return np.asarray(predictions, dtype=float)
 
 
-def load_sample_phenotype_rows(
-    phenotype_file: str,
-    sample_name: str,
-) -> tuple[list[dict[str, object]], list[str]]:
-    path = Path(phenotype_file)
-    if not path.exists():
-        raise FileNotFoundError(f"Phenotype file not found: {path}")
-
-    rows = load_csv_rows(path)
-    if not rows:
-        raise ValueError(f"Phenotype file is empty: {path}")
-
-    header = list(rows[0].keys())
-    if len(header) < 3:
+def validate_genotype_columns(columns: Sequence[str]) -> None:
+    invalid_columns = [column for column in columns if SITE_ID_PATTERN.fullmatch(str(column)) is None]
+    if invalid_columns:
         raise ValueError(
-            "Phenotype file must contain at least three columns: sample, value, and one-hot location feature columns"
+            "Genotype feature columns must use the format 'ChrN:Pos'. Invalid columns: "
+            + ",".join(invalid_columns[:20])
+            + ("..." if len(invalid_columns) > 20 else "")
         )
-    if header[0] != "sample" or header[1] != "value":
-        raise ValueError("Phenotype file first two columns must be: sample, value")
 
-    location_columns = header[2:]
-    sample_rows = [row for row in rows if str(row.get("sample", "")).strip() == sample_name]
-    if not sample_rows:
-        raise ValueError(f"Sample '{sample_name}' not found in phenotype file: {path}")
 
-    parsed_rows: list[dict[str, object]] = []
-    for row in sample_rows:
-        parsed_row: dict[str, object] = {
-            "sample": sample_name,
-            "value": float(str(row["value"]).strip()),
-        }
-        for column in location_columns:
-            parsed_row[column] = int(float(str(row.get(column, "0")).strip() or "0"))
-        parsed_rows.append(parsed_row)
+def load_input_matrices(genotype_file: str, phenotype_file: str) -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
+    genotype_path = Path(genotype_file)
+    phenotype_path = Path(phenotype_file)
+    if not genotype_path.exists():
+        raise FileNotFoundError(f"Genotype file not found: {genotype_path}")
+    if not phenotype_path.exists():
+        raise FileNotFoundError(f"Phenotype file not found: {phenotype_path}")
+
+    genotype_df = pd.read_csv(genotype_path)
+    phenotype_df = pd.read_csv(phenotype_path)
+    if genotype_df.empty:
+        raise ValueError(f"Genotype file is empty: {genotype_path}")
+    if phenotype_df.empty:
+        raise ValueError(f"Phenotype file is empty: {phenotype_path}")
+
+    genotype_columns = list(genotype_df.columns)
+    phenotype_columns = list(phenotype_df.columns)
+    if genotype_columns[0] != "sample":
+        raise ValueError("genotype_file first column must be 'sample'")
+    if len(phenotype_columns) < 3 or phenotype_columns[0] != "sample" or phenotype_columns[1] != "value":
+        raise ValueError("phenotype_file first two columns must be 'sample' and 'value'")
+
+    location_columns = [column for column in phenotype_columns[2:] if str(column).startswith("loc")]
+    non_location_columns = [column for column in phenotype_columns[2:] if column not in location_columns]
+    if non_location_columns:
+        raise ValueError(
+            "All phenotype feature columns after 'value' must start with 'loc'. Invalid columns: "
+            + ",".join(non_location_columns[:20])
+            + ("..." if len(non_location_columns) > 20 else "")
+        )
+
+    genotype_feature_columns = genotype_columns[1:]
+    if not genotype_feature_columns:
+        raise ValueError("genotype_file must contain genotype feature columns after 'sample'")
+    validate_genotype_columns(genotype_feature_columns)
+
+    genotype_df = genotype_df.copy()
+    phenotype_df = phenotype_df.copy()
+    genotype_df["sample"] = genotype_df["sample"].astype(str)
+    phenotype_df["sample"] = phenotype_df["sample"].astype(str)
+
+    for column in genotype_feature_columns:
+        genotype_df[column] = pd.to_numeric(genotype_df[column], errors="raise").astype(int)
+        invalid_mask = ~genotype_df[column].isin(VALID_GENOTYPES)
+        if bool(invalid_mask.any()):
+            raise ValueError(f"Genotype column contains values outside {VALID_GENOTYPES}: {column}")
+
+    phenotype_df["value"] = pd.to_numeric(phenotype_df["value"], errors="raise").astype(float)
+    for column in location_columns:
+        phenotype_df[column] = pd.to_numeric(phenotype_df[column], errors="raise").astype(int)
 
     log_info(
-        "Loaded phenotype rows for sample: sample={} rows={} location_features={} source={}",
-        sample_name,
-        len(parsed_rows),
+        "Loaded input matrices: genotype_rows={} phenotype_rows={} genotype_features={} location_features={}",
+        len(genotype_df),
+        len(phenotype_df),
+        len(genotype_feature_columns),
         len(location_columns),
-        path,
     )
-    return parsed_rows, location_columns
+    return genotype_df, phenotype_df, genotype_feature_columns, location_columns
 
 
-def group_phenotype_rows_by_location(
-    phenotype_rows: list[dict[str, object]],
-    location_columns: Sequence[str],
-) -> list[dict[str, object]]:
-    grouped: dict[tuple[int, ...], list[dict[str, object]]] = {}
-    for row in phenotype_rows:
-        key = tuple(int(row[column]) for column in location_columns)
-        grouped.setdefault(key, []).append(row)
+def build_merged_matrix(phenotype_df: pd.DataFrame, genotype_df: pd.DataFrame) -> pd.DataFrame:
+    merged = phenotype_df.merge(genotype_df, on="sample", how="inner", sort=False)
+    phenotype_columns = list(phenotype_df.columns)
+    genotype_columns = [column for column in genotype_df.columns if column != "sample"]
+    merged = merged.loc[:, phenotype_columns + genotype_columns]
+    if merged.empty:
+        raise ValueError("Merged phenotype/genotype matrix is empty. Please check shared sample IDs.")
+    log_info("Built merged matrix: rows={} columns={}", len(merged), len(merged.columns))
+    return merged
 
-    group_infos: list[dict[str, object]] = []
-    for index, (key, rows) in enumerate(grouped.items(), start=1):
-        location_features = {column: int(value) for column, value in zip(location_columns, key)}
+
+def filter_sample_rows(merged_df: pd.DataFrame, sample_id: str) -> pd.DataFrame:
+    filtered = merged_df[merged_df["sample"].astype(str) == str(sample_id)].copy()
+    if filtered.empty:
+        raise ValueError(f"sample_id '{sample_id}' not found in merged phenotype/genotype matrix")
+    filtered = filtered.reset_index(drop=True)
+    log_info("Filtered merged matrix by sample: sample_id={} rows={}", sample_id, len(filtered))
+    return filtered
+
+
+def load_mutable_features(
+    feature_importance_file: str,
+    genotype_feature_columns: Sequence[str],
+    top_n: int,
+) -> list[str]:
+    path = Path(feature_importance_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Feature-importance file not found: {path}")
+
+    importance_df = pd.read_csv(path)
+    required_columns = ["feature", "importance_gain", "importance_split"]
+    missing_columns = [column for column in required_columns if column not in importance_df.columns]
+    if missing_columns:
+        raise ValueError("feature_importance_file missing columns: " + ",".join(missing_columns))
+
+    importance_df = importance_df.copy()
+    importance_df["feature"] = importance_df["feature"].astype(str)
+    importance_df["importance_gain"] = pd.to_numeric(importance_df["importance_gain"], errors="raise").astype(float)
+    importance_df["importance_split"] = pd.to_numeric(importance_df["importance_split"], errors="raise").astype(float)
+
+    genotype_feature_set = set(str(column) for column in genotype_feature_columns)
+    filtered = importance_df[
+        importance_df["feature"].isin(genotype_feature_set)
+        & ~importance_df["feature"].str.startswith("loc")
+    ].copy()
+    filtered = filtered.sort_values(["importance_gain", "importance_split"], ascending=[False, False])
+    mutable_features = filtered["feature"].head(int(top_n)).tolist()
+    if not mutable_features:
+        raise ValueError("No mutable genotype features found in feature_importance_file")
+
+    missing_from_genotype = [feature for feature in mutable_features if feature not in genotype_feature_set]
+    if missing_from_genotype:
+        raise ValueError("Mutable features missing from genotype matrix: " + ",".join(missing_from_genotype))
+
+    log_info("Selected mutable features: top_n={} selected={}", top_n, len(mutable_features))
+    return mutable_features
+
+
+def load_variant_effects(variant_effect_file: str, genotype_feature_columns: Sequence[str]) -> dict[str, float]:
+    path = Path(variant_effect_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Variant-effect file not found: {path}")
+
+    effect_df = pd.read_csv(path)
+    required_columns = ["Chromosome", "Position", "site_id", "var_effect"]
+    missing_columns = [column for column in required_columns if column not in effect_df.columns]
+    if missing_columns:
+        raise ValueError("variant_effect_file missing columns: " + ",".join(missing_columns))
+
+    effect_df = effect_df.copy()
+    effect_df["site_id"] = effect_df["site_id"].astype(str)
+    effect_df["var_effect"] = pd.to_numeric(effect_df["var_effect"], errors="raise").astype(float)
+    effect_map = dict(zip(effect_df["site_id"], effect_df["var_effect"]))
+
+    missing_effects = [feature for feature in genotype_feature_columns if feature not in effect_map]
+    if missing_effects:
+        raise ValueError(
+            "variant_effect_file is missing genotype feature effects: "
+            + ",".join(missing_effects[:20])
+            + ("..." if len(missing_effects) > 20 else "")
+        )
+    log_info("Loaded variant effects: count={} source={}", len(effect_map), path)
+    return effect_map
+
+
+def group_filtered_rows_by_location(filtered_df: pd.DataFrame, location_columns: Sequence[str]) -> list[dict[str, object]]:
+    if not location_columns:
+        raise ValueError("No location columns found in phenotype_file")
+
+    grouped: list[dict[str, object]] = []
+    groupby_obj = filtered_df.groupby(list(location_columns), dropna=False, sort=False)
+    for index, (group_key, group_df) in enumerate(groupby_obj, start=1):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+        location_features = {
+            column: int(value)
+            for column, value in zip(location_columns, group_key)
+        }
         active_locations = [column for column, value in location_features.items() if int(value) == 1]
         location_label = "__".join(active_locations) if active_locations else f"location_group_{index:03d}"
-        mean_value = sum(float(row["value"]) for row in rows) / len(rows)
-        group_infos.append(
+        grouped.append(
             {
                 "group_id": f"group_{index:03d}",
                 "location_label": location_label,
                 "location_features": location_features,
-                "row_count": len(rows),
-                "actual_value_mean": mean_value,
-                "rows": rows,
+                "row_count": int(len(group_df)),
+                "actual_value_mean": float(group_df["value"].mean()),
+                "group_df": group_df.reset_index(drop=True),
             }
         )
-    return group_infos
+    log_info("Grouped filtered rows by location: groups={}", len(grouped))
+    return grouped
 
 
-def append_location_features(
-    feature_rows: list[dict[str, object]],
-    location_features: dict[str, int],
-) -> list[dict[str, object]]:
-    combined_rows: list[dict[str, object]] = []
-    for row in feature_rows:
-        merged = dict(row)
-        merged.update(location_features)
-        combined_rows.append(merged)
-    return combined_rows
+def build_combination_frame(
+    base_row: pd.Series,
+    sample_id: str,
+    location_columns: Sequence[str],
+    genotype_feature_columns: Sequence[str],
+    mutable_features: Sequence[str],
+    effect_map: dict[str, float],
+) -> pd.DataFrame:
+    mutable_features = list(mutable_features)
+    mutable_feature_set = set(mutable_features)
+    non_mutable_features = [column for column in genotype_feature_columns if column not in mutable_feature_set]
+    total_combinations = len(VALID_GENOTYPES) ** len(mutable_features)
+    if total_combinations <= 0:
+        raise ValueError("No combinations generated for mutable features")
+
+    genotype_data: dict[str, np.ndarray] = {}
+    for column in non_mutable_features:
+        genotype_data[column] = np.full(total_combinations, int(base_row[column]), dtype=np.int8)
+
+    if mutable_features:
+        combos = np.asarray(list(product(VALID_GENOTYPES, repeat=len(mutable_features))), dtype=np.int8)
+        for idx, column in enumerate(mutable_features):
+            genotype_data[column] = combos[:, idx]
+        original_signature = np.asarray([int(base_row[column]) for column in mutable_features], dtype=np.int8)
+        target_mask = np.all(combos == original_signature, axis=1)
+    else:
+        target_mask = np.asarray([True], dtype=bool)
+
+    if int(target_mask.sum()) != 1:
+        raise ValueError("Expected exactly one original genotype combination in the simulated combination set")
+
+    combo_ids = [f"sim_{idx:06d}" for idx in range(total_combinations)]
+    samples = [f"{sample_id}_sim_{idx:06d}" for idx in range(total_combinations)]
+    target_index = int(np.flatnonzero(target_mask)[0])
+    combo_ids[target_index] = "original"
+    samples[target_index] = str(sample_id)
+
+    feature_df = pd.DataFrame({
+        "sample": samples,
+        "combination_id": combo_ids,
+        "is_target": target_mask.astype(bool),
+        "source_sample": [str(sample_id)] * total_combinations,
+    })
+    for column in location_columns:
+        feature_df[column] = int(base_row[column])
+    for column in genotype_feature_columns:
+        effect = float(effect_map[column])
+        feature_df[column] = np.asarray(genotype_data[column], dtype=np.float32) * effect
+    return feature_df
 
 
 def rank_predictions(
-    weighted_rows: list[dict[str, object]],
-    predictions: list[float],
-    rank_sample: str,
-    descending: bool = True,
-) -> list[dict[str, object]]:
-    prediction_rows = [
-        {
-            "sample": str(row["sample"]),
-            "predicted_phenotype": float(pred),
-        }
-        for row, pred in zip(weighted_rows, predictions)
-    ]
-    prediction_rows.sort(key=lambda row: row["predicted_phenotype"], reverse=descending)
-    for rank, row in enumerate(prediction_rows, start=1):
-        row["rank"] = rank
-        row["is_target"] = row["sample"] == rank_sample
-
-    matched = [row for row in prediction_rows if row["sample"] == rank_sample]
-    if not matched:
-        raise ValueError(f"Rank sample '{rank_sample}' not found in simulated samples")
-    return prediction_rows
+    prediction_df: pd.DataFrame,
+    predictions: np.ndarray,
+    descending: bool,
+) -> pd.DataFrame:
+    ranking_df = prediction_df.loc[:, ["sample", "combination_id", "is_target", "source_sample"]].copy()
+    ranking_df["predicted_phenotype"] = np.asarray(predictions, dtype=float)
+    ranking_df = ranking_df.sort_values("predicted_phenotype", ascending=not descending).reset_index(drop=True)
+    ranking_df["rank"] = np.arange(1, len(ranking_df) + 1, dtype=int)
+    return ranking_df.loc[:, ["sample", "combination_id", "predicted_phenotype", "rank", "is_target", "source_sample"]]
 
 
 def _scale_value(value: float, src_min: float, src_max: float, dst_min: float, dst_max: float) -> float:
@@ -329,10 +430,11 @@ def _scale_value(value: float, src_min: float, src_max: float, dst_min: float, d
 
 
 def write_rank_scatter_svg(
-    ranking_rows: list[dict[str, object]],
+    ranking_df: pd.DataFrame,
     target_sample: str,
     output_path: Path,
 ) -> None:
+    rows = ranking_df.to_dict(orient="records")
     width = 1200
     height = 700
     left = 90
@@ -342,8 +444,8 @@ def write_rank_scatter_svg(
     plot_width = width - left - right
     plot_height = height - top - bottom
 
-    ranks = [int(row["rank"]) for row in ranking_rows]
-    values = [float(row["predicted_phenotype"]) for row in ranking_rows]
+    ranks = [int(row["rank"]) for row in rows]
+    values = [float(row["predicted_phenotype"]) for row in rows]
     min_rank = min(ranks)
     max_rank = max(ranks)
     min_value = min(values)
@@ -351,7 +453,7 @@ def write_rank_scatter_svg(
 
     points: list[str] = []
     target_label = ""
-    for row in ranking_rows:
+    for row in rows:
         x = _scale_value(float(row["rank"]), float(min_rank), float(max_rank), left, left + plot_width)
         y = _scale_value(float(row["predicted_phenotype"]), min_value, max_value, top + plot_height, top)
         is_target = bool(row["is_target"])
@@ -363,7 +465,7 @@ def write_rank_scatter_svg(
             label_y = max(20.0, y - 14.0)
             target_label = (
                 f'<text x="{x + 8:.2f}" y="{label_y:.2f}" font-size="14" fill="#d62728">'
-                f'{row["sample"]} (rank={row["rank"]}, pred={row["predicted_phenotype"]:.6f})'
+                f'{target_sample} (rank={row["rank"]}, pred={row["predicted_phenotype"]:.6f})'
                 "</text>"
                 f'<line x1="{x:.2f}" y1="{y:.2f}" x2="{x + 6:.2f}" y2="{label_y - 5:.2f}" stroke="#d62728" stroke-width="1.5" />'
             )
@@ -374,7 +476,7 @@ def write_rank_scatter_svg(
     ]
 
     x_ticks = []
-    tick_count = min(10, len(ranking_rows))
+    tick_count = min(10, len(rows))
     for i in range(tick_count):
         tick_rank = 1 if tick_count == 1 else round(min_rank + i * (max_rank - min_rank) / (tick_count - 1))
         x = _scale_value(float(tick_rank), float(min_rank), float(max_rank), left, left + plot_width)
@@ -399,7 +501,7 @@ def write_rank_scatter_svg(
 {''.join(points)}
 {target_label}
 <circle cx="{width - 170}" cy="44" r="4" fill="#bdbdbd" />
-<text x="{width - 160}" y="48" font-size="12" fill="#444">background samples</text>
+<text x="{width - 160}" y="48" font-size="12" fill="#444">background combinations</text>
 <circle cx="{width - 170}" cy="66" r="5" fill="#d62728" />
 <text x="{width - 160}" y="70" font-size="12" fill="#444">target sample: {target_sample}</text>
 </svg>
@@ -408,266 +510,45 @@ def write_rank_scatter_svg(
     log_info("Wrote ranking scatter SVG: {}", output_path)
 
 
-def load_single_sample_genotype(genotype_file: str, sample_name: str | None) -> tuple[str, list[str], dict[str, int]]:
-    path = Path(genotype_file)
-    if not path.exists():
-        raise FileNotFoundError(f"Genotype file not found: {path}")
-
-    rows = load_csv_rows(path)
-    if not rows:
-        raise ValueError(f"Genotype file is empty: {path}")
-    if "sample" not in rows[0]:
-        raise ValueError("Genotype file must contain a 'sample' column as the first column")
-
-    if sample_name is None:
-        if len(rows) != 1:
-            raise ValueError(
-                "Genotype file contains multiple samples. Please provide --sample-name to choose one sample."
-            )
-        target_row = rows[0]
-    else:
-        matched = [row for row in rows if row.get("sample", "") == sample_name]
-        if not matched:
-            raise ValueError(f"Sample '{sample_name}' not found in genotype file: {path}")
-        if len(matched) > 1:
-            raise ValueError(f"Sample '{sample_name}' appears multiple times in genotype file: {path}")
-        target_row = matched[0]
-
-    selected_sample = str(target_row["sample"])
-    site_columns = [column for column in target_row.keys() if column != "sample"]
-    if not site_columns:
-        raise ValueError("Genotype file does not contain any site columns")
-    invalid_site_columns = [column for column in site_columns if SITE_ID_PATTERN.fullmatch(str(column)) is None]
-    if invalid_site_columns:
-        raise ValueError(
-            "Genotype feature columns must use the format 'ChrN:Pos'. Invalid columns: "
-            + ",".join(invalid_site_columns[:20])
-            + ("..." if len(invalid_site_columns) > 20 else "")
-        )
-
-    genotype_map: dict[str, int] = {}
-    for site_id in site_columns:
-        raw_value = str(target_row.get(site_id, "")).strip()
-        try:
-            genotype = int(raw_value)
-        except ValueError as exc:
-            raise ValueError(f"Invalid genotype value for site {site_id}: {raw_value}") from exc
-        if genotype not in VALID_GENOTYPES:
-            raise ValueError(f"Genotype value for site {site_id} must be one of {sorted(VALID_GENOTYPES)}")
-        genotype_map[site_id] = genotype
-
-    log_info(
-        "Loaded genotype sample: sample={} total_sites={} source={}",
-        selected_sample,
-        len(site_columns),
-        path,
-    )
-    return selected_sample, site_columns, genotype_map
-
-
-def load_mutable_sites(mutable_sites_file: str) -> list[MutableSite]:
-    path = Path(mutable_sites_file)
-    if not path.exists():
-        raise FileNotFoundError(f"Mutable-site file not found: {path}")
-
-    rows = load_csv_rows(path)
-    if not rows:
-        raise ValueError(f"Mutable-site file is empty: {path}")
-    header = list(rows[0].keys())
-    if len(header) < 2 or header[0] != "Chromosome" or header[1] != "Position":
-        raise ValueError("Mutable-site file first two columns must be: Chromosome, Position")
-
-    sites: list[MutableSite] = []
-    seen: set[str] = set()
-    for row in rows:
-        site = MutableSite(chrom=str(row["Chromosome"]).strip(), pos=int(str(row["Position"]).strip()))
-        if site.site_id in seen:
-            raise ValueError(f"Duplicate mutable site detected: {site.site_id}")
-        seen.add(site.site_id)
-        sites.append(site)
-    log_info("Loaded mutable sites: count={} source={}", len(sites), path)
-    return sites
-
-
-def validate_mutable_sites_in_genotype(site_columns: Sequence[str], mutable_sites: Sequence[MutableSite]) -> None:
-    site_set = set(site_columns)
-    missing = [site.site_id for site in mutable_sites if site.site_id not in site_set]
-    if missing:
-        raise ValueError(
-            "Some mutable sites are not present in the genotype matrix columns: "
-            + ",".join(missing)
-        )
-
-
-def load_variant_effects(variant_effect_file: str, site_columns: Sequence[str]) -> dict[str, float]:
-    path = Path(variant_effect_file)
-    if not path.exists():
-        raise FileNotFoundError(f"Variant-effect file not found: {path}")
-
-    rows = load_csv_rows(path)
-    if not rows:
-        raise ValueError(f"Variant-effect file is empty: {path}")
-
-    header = list(rows[0].keys())
-    if len(header) < 3:
-        raise ValueError(
-            "Variant-effect file must contain at least three columns: Chromosome, Position, ..., var_effect"
-        )
-    if header[0] != "Chromosome" or header[1] != "Position" or header[-1] != "var_effect":
-        raise ValueError(
-            "Variant-effect file format must be: first column Chromosome, second column Position, last column var_effect"
-        )
-
-    effect_map: dict[str, float] = {}
-    for row in rows:
-        site_id = f"{str(row['Chromosome']).strip()}:{int(str(row['Position']).strip())}"
-        effect_map[site_id] = float(str(row["var_effect"]).strip())
-
-    missing_effects = [site_id for site_id in site_columns if site_id not in effect_map]
-    if missing_effects:
-        raise ValueError(
-            "Variant-effect file is missing some genotype sites: "
-            + ",".join(missing_effects[:20])
-            + ("..." if len(missing_effects) > 20 else "")
-        )
-    log_info("Loaded variant effects: count={} source={}", len(effect_map), path)
-    return effect_map
-
-
-def alternative_genotypes(original: int) -> list[int]:
-    return [value for value in sorted(VALID_GENOTYPES) if value != original]
-
-
-def build_sample_rows(
-    sample_id: str,
-    site_columns: Sequence[str],
-    genotype_map: dict[str, int],
-    effect_map: dict[str, float],
-) -> tuple[dict[str, object], dict[str, object]]:
-    genotype_row: dict[str, object] = {"sample": sample_id}
-    weighted_row: dict[str, object] = {"sample": sample_id}
-    for site_id in site_columns:
-        genotype_value = int(genotype_map[site_id])
-        genotype_row[site_id] = genotype_value
-        weighted_row[site_id] = float(genotype_value) * float(effect_map[site_id])
-    return genotype_row, weighted_row
-
-
-def build_simulated_rows(
-    original_sample: str,
-    site_columns: Sequence[str],
-    genotype_map: dict[str, int],
-    mutable_sites: Sequence[MutableSite],
-    effect_map: dict[str, float],
-) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
-    mutable_site_ids = [site.site_id for site in mutable_sites]
-    mutable_value_choices = [alternative_genotypes(genotype_map[site_id]) for site_id in mutable_site_ids]
-    total_samples = 2 ** len(mutable_site_ids)
-    log_info(
-        "Enumerating simulated combinations: mutable_sites={} total_simulated_samples={}",
-        len(mutable_site_ids),
-        total_samples,
-    )
-
-    genotype_rows: list[dict[str, object]] = []
-    weighted_rows: list[dict[str, object]] = []
-    metadata_rows: list[dict[str, object]] = []
-    genotype_signatures: set[tuple[int, ...]] = set()
-
-    for combo_index, combo_values in enumerate(product(*mutable_value_choices), start=1):
-        sample_id = f"{original_sample}_sim_{combo_index:06d}"
-        simulated_genotypes = dict(genotype_map)
-        mutation_desc_parts: list[str] = []
-        for site_id, new_value in zip(mutable_site_ids, combo_values):
-            old_value = simulated_genotypes[site_id]
-            simulated_genotypes[site_id] = int(new_value)
-            mutation_desc_parts.append(f"{site_id}:{old_value}>{new_value}")
-
-        genotype_row, weighted_row = build_sample_rows(
-            sample_id=sample_id,
-            site_columns=site_columns,
-            genotype_map=simulated_genotypes,
-            effect_map=effect_map,
-        )
-        genotype_rows.append(genotype_row)
-        weighted_rows.append(weighted_row)
-        genotype_signature = tuple(int(genotype_row[site_id]) for site_id in site_columns)
-        genotype_signatures.add(genotype_signature)
-        metadata_rows.append(
-            {
-                "sample": sample_id,
-                "source_sample": original_sample,
-                "mutable_site_count": len(mutable_site_ids),
-                "mutated_sites": ";".join(mutable_site_ids),
-                "genotype_signature": "|".join(str(int(genotype_row[site_id])) for site_id in site_columns),
-                "mutation_path": ";".join(mutation_desc_parts),
-            }
-        )
-
-    if mutable_site_ids and len(genotype_signatures) <= 1:
-        raise ValueError(
-            "Simulation produced only one unique genotype although mutable sites were provided. "
-            "Please check genotype_file column names and mutable_sites_file entries."
-        )
-    log_info(
-        "Simulated genotype uniqueness check: unique_genotypes={} total_rows={}",
-        len(genotype_signatures),
-        len(genotype_rows),
-    )
-    return genotype_rows, weighted_rows, metadata_rows
-
-
-def save_outputs(
+def save_group_outputs(
     outdir: Path,
-    site_columns: Sequence[str],
-    genotype_rows: list[dict[str, object]],
-    weighted_rows: list[dict[str, object]],
-    metadata_rows: list[dict[str, object]],
-    original_sample: str,
-    mutable_sites: Sequence[MutableSite],
+    group_id: str,
+    merged_group_df: pd.DataFrame,
+    simulated_feature_df: pd.DataFrame,
+    ranking_df: pd.DataFrame,
+    target_sample: str,
 ) -> dict[str, object]:
     outdir.mkdir(parents=True, exist_ok=True)
 
-    genotype_csv = outdir / "simulated_genotype_012.csv"
-    genotype_parquet = outdir / "simulated_genotype_012.parquet"
-    weighted_csv = outdir / "simulated_variant_effect_matrix.csv"
-    weighted_parquet = outdir / "simulated_variant_effect_matrix.parquet"
-    metadata_csv = outdir / "simulated_metadata.csv"
-    metadata_json = outdir / "simulated_summary.json"
+    merged_csv = outdir / f"merged_pheno_geno_{group_id}.csv"
+    merged_parquet = outdir / f"merged_pheno_geno_{group_id}.parquet"
+    simulated_csv = outdir / f"simulated_weighted_features_{group_id}.csv"
+    simulated_parquet = outdir / f"simulated_weighted_features_{group_id}.parquet"
+    ranking_csv = outdir / f"simulated_prediction_ranking_{group_id}.csv"
+    ranking_parquet = outdir / f"simulated_prediction_ranking_{group_id}.parquet"
+    scatter_svg = outdir / f"simulated_prediction_ranking_{group_id}.svg"
 
-    genotype_fields = ["sample"] + list(site_columns)
-    write_csv(genotype_rows, genotype_csv, genotype_fields)
-    genotype_parquet_ok = maybe_write_parquet(genotype_rows, genotype_parquet)
-    log_info("Wrote simulated genotype matrix: {} rows={}", genotype_csv, len(genotype_rows))
+    merged_group_df.to_csv(merged_csv, index=False)
+    merged_parquet_ok = maybe_write_parquet(merged_group_df, merged_parquet)
+    simulated_feature_df.to_csv(simulated_csv, index=False)
+    simulated_parquet_ok = maybe_write_parquet(simulated_feature_df, simulated_parquet)
+    ranking_df.to_csv(ranking_csv, index=False)
+    ranking_parquet_ok = maybe_write_parquet(ranking_df, ranking_parquet)
+    write_rank_scatter_svg(ranking_df, target_sample, scatter_svg)
 
-    write_csv(weighted_rows, weighted_csv, genotype_fields)
-    weighted_parquet_ok = maybe_write_parquet(weighted_rows, weighted_parquet)
-    log_info("Wrote simulated weighted matrix: {} rows={}", weighted_csv, len(weighted_rows))
-
-    write_csv(
-        metadata_rows,
-        metadata_csv,
-        ["sample", "source_sample", "mutable_site_count", "mutated_sites", "genotype_signature", "mutation_path"],
-    )
-    log_info("Wrote simulation metadata: {} rows={}", metadata_csv, len(metadata_rows))
-
-    summary = {
-        "source_sample": original_sample,
-        "total_sites": len(site_columns),
-        "mutable_sites": len(mutable_sites),
-        "simulated_samples": len(genotype_rows),
-        "summary_json": str(metadata_json),
-        "files": {
-            "simulated_genotype_csv": str(genotype_csv),
-            "simulated_genotype_parquet": str(genotype_parquet) if genotype_parquet_ok else None,
-            "simulated_variant_effect_matrix_csv": str(weighted_csv),
-            "simulated_variant_effect_matrix_parquet": str(weighted_parquet) if weighted_parquet_ok else None,
-            "simulated_metadata_csv": str(metadata_csv),
-        },
+    target_row = ranking_df[ranking_df["is_target"]].iloc[0]
+    return {
+        "group_id": group_id,
+        "merged_pheno_geno_csv": str(merged_csv),
+        "merged_pheno_geno_parquet": str(merged_parquet) if merged_parquet_ok else None,
+        "simulated_feature_csv": str(simulated_csv),
+        "simulated_feature_parquet": str(simulated_parquet) if simulated_parquet_ok else None,
+        "prediction_ranking_csv": str(ranking_csv),
+        "prediction_ranking_parquet": str(ranking_parquet) if ranking_parquet_ok else None,
+        "prediction_ranking_svg": str(scatter_svg),
+        "target_rank": int(target_row["rank"]),
+        "target_predicted_phenotype": float(target_row["predicted_phenotype"]),
     }
-    metadata_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    log_info("Wrote simulation summary: {}", metadata_json)
-    return summary
 
 
 def write_summary_json(summary: dict[str, object]) -> None:
@@ -676,47 +557,11 @@ def write_summary_json(summary: dict[str, object]) -> None:
     log_info("Updated simulation summary: {}", summary_path)
 
 
-def save_prediction_outputs(
-    outdir: Path,
-    ranking_rows: list[dict[str, object]],
-    rank_sample: str,
-    file_prefix: str = "simulated_prediction_ranking",
-) -> dict[str, object]:
-    prediction_csv = outdir / f"{file_prefix}.csv"
-    prediction_parquet = outdir / f"{file_prefix}.parquet"
-    scatter_svg = outdir / f"{file_prefix}.svg"
-
-    fields = ["sample", "predicted_phenotype", "rank", "is_target"]
-    write_csv(ranking_rows, prediction_csv, fields)
-    prediction_parquet_ok = maybe_write_parquet(ranking_rows, prediction_parquet)
-    write_rank_scatter_svg(ranking_rows, rank_sample, scatter_svg)
-
-    target_row = next(row for row in ranking_rows if bool(row["is_target"]))
-    log_info(
-        "Saved prediction ranking: sample={} rank={} predicted_phenotype={:.6f}",
-        rank_sample,
-        target_row["rank"],
-        float(target_row["predicted_phenotype"]),
-    )
-    return {
-        "prediction_ranking_csv": str(prediction_csv),
-        "prediction_ranking_parquet": str(prediction_parquet) if prediction_parquet_ok else None,
-        "prediction_ranking_svg": str(scatter_svg),
-        "target_sample": rank_sample,
-        "target_rank": int(target_row["rank"]),
-        "target_predicted_phenotype": float(target_row["predicted_phenotype"]),
-    }
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Enumerate all genotype combinations by mutating selected sites of one sample."
+        description="Simulate mutable genotype-feature combinations for one sample across phenotype location groups."
     )
-    parser.add_argument(
-        "--config",
-        required=True,
-        help="YAML config file path.",
-    )
+    parser.add_argument("--config", required=True, help="YAML config file path.")
     return parser.parse_args()
 
 
@@ -726,113 +571,103 @@ def main() -> None:
     config = load_yaml_config(args.config)
 
     genotype_file = str(require_config_value(config, "genotype_file"))
-    mutable_sites_file = str(require_config_value(config, "mutable_sites_file"))
+    phenotype_file = str(require_config_value(config, "phenotype_file"))
+    feature_importance_file = str(require_config_value(config, "feature_importance_file"))
     variant_effect_file = str(require_config_value(config, "variant_effect_file"))
+    model_file = str(require_config_value(config, "model_file"))
+    sample_id = str(require_config_value(config, "sample_id"))
     outdir = Path(str(config.get("outdir", "simulated_combination_outputs")))
-    sample_name = config.get("sample_name")
-    model_file = config.get("model_file")
-    phenotype_file = config.get("phenotype_file")
+    top_n = int(config.get("top_n", 10))
     rank_order = str(config.get("rank_order", "desc")).lower()
     log_level = str(config.get("log_level", "INFO")).upper()
 
     if rank_order not in {"desc", "asc"}:
         raise ValueError("rank_order must be one of: desc, asc")
+    if top_n <= 0:
+        raise ValueError("top_n must be a positive integer")
 
     LOGGER = get_logger(outdir / "simulated_combination.log", level=log_level)
     log_info("Loaded config: {}", args.config)
 
-    original_sample, site_columns, genotype_map = load_single_sample_genotype(
+    genotype_df, phenotype_df, genotype_feature_columns, location_columns = load_input_matrices(
         genotype_file=genotype_file,
-        sample_name=None if sample_name in {None, ""} else str(sample_name),
+        phenotype_file=phenotype_file,
     )
-    mutable_sites = load_mutable_sites(mutable_sites_file)
-    validate_mutable_sites_in_genotype(site_columns, mutable_sites)
-    effect_map = load_variant_effects(variant_effect_file, site_columns)
+    merged_pheno_geno = build_merged_matrix(phenotype_df, genotype_df)
+    merged_sample_df = filter_sample_rows(merged_pheno_geno, sample_id)
+    mutable_features = load_mutable_features(
+        feature_importance_file=feature_importance_file,
+        genotype_feature_columns=genotype_feature_columns,
+        top_n=top_n,
+    )
+    effect_map = load_variant_effects(
+        variant_effect_file=variant_effect_file,
+        genotype_feature_columns=genotype_feature_columns,
+    )
+    location_groups = group_filtered_rows_by_location(merged_sample_df, location_columns)
+    model = load_model(model_file)
 
-    genotype_rows, weighted_rows, metadata_rows = build_simulated_rows(
-        original_sample=original_sample,
-        site_columns=site_columns,
-        genotype_map=genotype_map,
-        mutable_sites=mutable_sites,
-        effect_map=effect_map,
-    )
-    summary = save_outputs(
-        outdir=outdir,
-        site_columns=site_columns,
-        genotype_rows=genotype_rows,
-        weighted_rows=weighted_rows,
-        metadata_rows=metadata_rows,
-        original_sample=original_sample,
-        mutable_sites=mutable_sites,
-    )
+    outdir.mkdir(parents=True, exist_ok=True)
+    merged_sample_csv = outdir / "merged_pheno_geno_filtered.csv"
+    merged_sample_parquet = outdir / "merged_pheno_geno_filtered.parquet"
+    merged_sample_df.to_csv(merged_sample_csv, index=False)
+    merged_sample_parquet_ok = maybe_write_parquet(merged_sample_df, merged_sample_parquet)
 
-    if model_file not in {None, ""}:
-        original_genotype_row, original_weighted_row = build_sample_rows(
-            sample_id=original_sample,
-            site_columns=site_columns,
-            genotype_map=genotype_map,
+    group_summaries: list[dict[str, object]] = []
+    feature_columns_for_prediction = list(location_columns) + list(genotype_feature_columns)
+    descending = rank_order == "desc"
+    total_combinations = len(VALID_GENOTYPES) ** len(mutable_features)
+
+    for group in location_groups:
+        group_id = str(group["group_id"])
+        group_df = pd.DataFrame(group["group_df"])
+        base_row = group_df.iloc[0]
+        simulation_feature_df = build_combination_frame(
+            base_row=base_row,
+            sample_id=sample_id,
+            location_columns=location_columns,
+            genotype_feature_columns=genotype_feature_columns,
+            mutable_features=mutable_features,
             effect_map=effect_map,
         )
-        model = load_model(str(model_file))
-        prediction_weighted_rows = [original_weighted_row] + weighted_rows
+        prediction_df = simulation_feature_df.loc[:, ["sample", "combination_id", "is_target", "source_sample"] + feature_columns_for_prediction]
+        predictions = predict_frame(model, prediction_df, feature_columns_for_prediction)
+        ranking_df = rank_predictions(prediction_df, predictions, descending=descending)
 
-        if phenotype_file not in {None, ""}:
-            phenotype_rows, location_columns = load_sample_phenotype_rows(
-                phenotype_file=str(phenotype_file),
-                sample_name=original_sample,
-            )
-            location_groups = group_phenotype_rows_by_location(phenotype_rows, location_columns)
-            prediction_groups: list[dict[str, object]] = []
-            for group in location_groups:
-                location_dir = outdir / "prediction_by_location" / str(group["group_id"])
-                location_dir.mkdir(parents=True, exist_ok=True)
-                combined_weighted_rows = append_location_features(
-                    prediction_weighted_rows,
-                    group["location_features"],
-                )
-                full_feature_columns = list(site_columns) + list(location_columns)
-                predictions = predict_rows(model, combined_weighted_rows, full_feature_columns)
-                ranking_rows = rank_predictions(
-                    weighted_rows=combined_weighted_rows,
-                    predictions=predictions,
-                    rank_sample=original_sample,
-                    descending=(rank_order == "desc"),
-                )
-                group_output = save_prediction_outputs(
-                    outdir=location_dir,
-                    ranking_rows=ranking_rows,
-                    rank_sample=original_sample,
-                    file_prefix=f"simulated_prediction_ranking_{group['group_id']}",
-                )
-                group_output["rank_target"] = "original_sample"
-                group_output["original_sample_included"] = True
-                group_output["group_id"] = group["group_id"]
-                group_output["location_label"] = group["location_label"]
-                group_output["row_count"] = int(group["row_count"])
-                group_output["actual_value_mean"] = float(group["actual_value_mean"])
-                group_output["location_features"] = group["location_features"]
-                prediction_groups.append(group_output)
-            summary["prediction"] = {
-                "mode": "grouped_by_location",
-                "location_feature_columns": location_columns,
-                "groups": prediction_groups,
-            }
-        else:
-            predictions = predict_rows(model, prediction_weighted_rows, site_columns)
-            ranking_rows = rank_predictions(
-                weighted_rows=prediction_weighted_rows,
-                predictions=predictions,
-                rank_sample=original_sample,
-                descending=(rank_order == "desc"),
-            )
-            summary["prediction"] = save_prediction_outputs(
-                outdir=outdir,
-                ranking_rows=ranking_rows,
-                rank_sample=original_sample,
-            )
-            summary["prediction"]["rank_target"] = "original_sample"
-            summary["prediction"]["original_sample_included"] = True
+        group_outdir = outdir / "prediction_by_location" / group_id
+        group_summary = save_group_outputs(
+            outdir=group_outdir,
+            group_id=group_id,
+            merged_group_df=group_df,
+            simulated_feature_df=simulation_feature_df,
+            ranking_df=ranking_df,
+            target_sample=sample_id,
+        )
+        group_summary["location_label"] = str(group["location_label"])
+        group_summary["row_count"] = int(group["row_count"])
+        group_summary["actual_value_mean"] = float(group["actual_value_mean"])
+        group_summary["location_features"] = dict(group["location_features"])
+        group_summaries.append(group_summary)
 
+    summary = {
+        "summary_json": str(outdir / "simulated_summary.json"),
+        "sample_id": sample_id,
+        "merged_rows": int(len(merged_sample_df)),
+        "genotype_feature_count": len(genotype_feature_columns),
+        "location_feature_count": len(location_columns),
+        "mutable_feature_count": len(mutable_features),
+        "mutable_features": mutable_features,
+        "combinations_per_group": int(total_combinations),
+        "files": {
+            "merged_pheno_geno_filtered_csv": str(merged_sample_csv),
+            "merged_pheno_geno_filtered_parquet": str(merged_sample_parquet) if merged_sample_parquet_ok else None,
+        },
+        "prediction": {
+            "mode": "grouped_by_location",
+            "rank_order": rank_order,
+            "groups": group_summaries,
+        },
+    }
     write_summary_json(summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

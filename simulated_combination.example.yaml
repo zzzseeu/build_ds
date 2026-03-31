@@ -1,9 +1,10 @@
 genotype_file: agront_ds_202603/splits/train_val_genotype_012.csv
-mutable_sites_file: agront_ds_202603/top10_variant_effect.csv
+phenotype_file: phenotype/phenotype_ETN_processed_20260227.csv
+feature_importance_file: agront_ds_202603/feature_importance.csv
 variant_effect_file: agront_ds_202603/all_site_variant_effect_by_site.csv
-sample_name: sample_72
+sample_id: sample_72
 outdir: ./simulated_combination_outputs
 model_file: ../../model_train/runs/lightgbm_variant_effect_ETN/model.joblib
+top_n: 10
 rank_order: desc
 log_level: INFO
-phenotype_file: phenotype/phenotype_ETN_processed_20260227.csv
