@@ -46,8 +46,7 @@
 
 主要包括：
 
-- `initLogger`
-- `getLogger`
+- `get_logger`
 - `standard_chrom`
 - `standard_sample_name`
 - `parse_gff3_attributes`

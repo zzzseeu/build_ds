@@ -15,7 +15,7 @@ from utils import (
     build_fasta_chrom_map,
     classify_variant_type,
     fetch_window_with_padding,
-    initLogger,
+    get_logger,
     standard_chrom,
 )
 
@@ -697,7 +697,7 @@ def main() -> None:
     args = _resolve_args_with_config(build_parser().parse_args())
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
-    logger = initLogger(outdir / "variant_tsv_alt_pca.log")
+    logger = get_logger(outdir / "variant_tsv_alt_pca.log")
 
     selected_classes = None
     if args.selected_classes:

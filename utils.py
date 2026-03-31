@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import sys
 from pathlib import Path
 from typing import Iterable
 import re
 from urllib.parse import unquote
 
-import numpy as np
-import pandas as pd
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - optional dependency
+    np = None
+
+try:
+    import pandas as pd
+except Exception:  # pragma: no cover - optional dependency
+    pd = None
 
 try:
     from loguru import logger as _loguru_logger
@@ -34,11 +42,29 @@ GFF3_COLUMNS = [
 _LOGURU_CONFIGURED = False
 
 
-def initLogger(log_file: str | Path | None = None, level: str = "INFO"):
-    """Initialize and return a shared project logger backed by loguru."""
+def get_logger(log_file: str | Path | None = None, level: str = "INFO"):
+    """Initialize and return a shared project logger backed by loguru when available."""
     global _LOGURU_CONFIGURED
     if _loguru_logger is None:
-        raise ImportError("loguru is required for initLogger")
+        logger = logging.getLogger("build_ds")
+        logger.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+        logger.handlers.clear()
+
+        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+        stream_handler.setFormatter(formatter)
+        logger.addHandler(stream_handler)
+
+        if log_file is not None:
+            log_file = Path(log_file)
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setLevel(getattr(logging, str(level).upper(), logging.INFO))
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        logger.propagate = False
+        return logger
 
     if not _LOGURU_CONFIGURED:
         _loguru_logger.remove()
@@ -58,11 +84,6 @@ def initLogger(log_file: str | Path | None = None, level: str = "INFO"):
             format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
         )
     return _loguru_logger
-
-
-def getLogger():
-    """Return the shared project logger, configuring stdout if needed."""
-    return initLogger()
 
 
 def standard_chrom(chrom: str) -> str | None:
@@ -104,6 +125,8 @@ def standard_sample_name(sample: str) -> str | None:
 
 def to_numpy_1d_embedding(x) -> np.ndarray:
     """Convert an embedding-like object into a 1D float32 numpy array."""
+    if np is None:
+        raise ImportError("numpy is required for embedding conversion")
     try:
         import torch
 

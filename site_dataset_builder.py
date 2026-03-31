@@ -17,7 +17,7 @@ from utils import (
     extract_gff3_feature_interval_trees,
     extract_gff3_feature_interval_trees_gffutils,
     fetch_window_with_padding,
-    initLogger,
+    get_logger,
     query_feature_interval_trees,
     standard_chrom,
     standard_sample_name,
@@ -74,7 +74,7 @@ class SiteDatasetBuilder:
         self.resume_dir = self.outdir / ".site_dataset_builder_resume"
         self.resume_dir.mkdir(parents=True, exist_ok=True)
         self.resume_state_path = self.resume_dir / "resume_state.json"
-        self.logger = initLogger(self.outdir / "site_dataset_builder.log")
+        self.logger = get_logger(self.outdir / "site_dataset_builder.log")
         self.sample_map: dict[str, str] = {}
         self.sample_list: list[str] = []
 
@@ -677,6 +677,22 @@ class SiteDatasetBuilder:
         self.logger.info(f"Saved variant effect matrix: {csv_path} shape={out_df.shape}")
         return csv_path, parquet_path, out_df
 
+    def _save_variant_effect_by_site(
+        self,
+        variant_effect_df: pd.DataFrame,
+        csv_name: str,
+        parquet_name: str,
+        stage_cache_name: str | None = None,
+    ) -> tuple[Path, Path]:
+        csv_path = self.outdir / csv_name
+        parquet_path = self.outdir / parquet_name
+        variant_effect_df.to_csv(csv_path, index=False)
+        variant_effect_df.to_parquet(parquet_path, index=False)
+        if stage_cache_name:
+            variant_effect_df.to_csv(self._stage_cache_path(stage_cache_name), index=False)
+        self.logger.info(f"Saved variant effect by site: {csv_path} shape={variant_effect_df.shape}")
+        return csv_path, parquet_path
+
     def _apply_sample_variants_to_gene(
         self,
         reference_seq: str,
@@ -864,6 +880,46 @@ class SiteDatasetBuilder:
                 [initial_site_path, initial_site_full],
             )
 
+        all_site_variant_effect_csv = self.outdir / "all_site_variant_effect_by_site.csv"
+        all_site_variant_effect_parquet = self.outdir / "all_site_variant_effect_by_site.parquet"
+        all_site_variant_effect_cache = self._stage_cache_path("all_site_variant_effect_by_site.csv")
+        if self._stage_completed(
+            state,
+            run_signature,
+            "all_site_variant_effects",
+            [
+                all_site_variant_effect_csv,
+                all_site_variant_effect_parquet,
+                all_site_variant_effect_cache,
+            ],
+        ):
+            self.logger.info(
+                f"Skipping all-site variant-effect calculation, reuse existing outputs: {all_site_variant_effect_csv}"
+            )
+        else:
+            all_unique_site_df = site_df.drop_duplicates(subset=["Chromosome", "Position"]).reset_index(drop=True)
+            all_site_variant_effect_df = self._compute_variant_effects(all_unique_site_df)
+            (
+                all_site_variant_effect_csv,
+                all_site_variant_effect_parquet,
+            ) = self._save_variant_effect_by_site(
+                all_site_variant_effect_df,
+                csv_name="all_site_variant_effect_by_site.csv",
+                parquet_name="all_site_variant_effect_by_site.parquet",
+                stage_cache_name="all_site_variant_effect_by_site.csv",
+            )
+            state = self._mark_stage_completed(
+                state,
+                run_signature,
+                signature_payload,
+                "all_site_variant_effects",
+                [
+                    all_site_variant_effect_csv,
+                    all_site_variant_effect_parquet,
+                    all_site_variant_effect_cache,
+                ],
+            )
+
         gene_site_output = self.outdir / "sites_in_gene.csv"
         gene_site_full = self._stage_cache_path("gene_sites.full.csv")
         if self._stage_completed(state, run_signature, "gene_sites", [gene_site_output, gene_site_full]):
@@ -970,6 +1026,8 @@ class SiteDatasetBuilder:
             "genotype_site_by_sample_csv": str(genotype_site_by_sample_path),
             "genotype_sample_by_site_csv": str(genotype_sample_by_site_csv),
             "genotype_sample_by_site_parquet": str(genotype_sample_by_site_parquet),
+            "all_site_variant_effect_by_site_csv": str(all_site_variant_effect_csv),
+            "all_site_variant_effect_by_site_parquet": str(all_site_variant_effect_parquet),
             "variant_effect_csv": str(variant_effect_csv),
             "variant_effect_parquet": str(variant_effect_parquet),
             "gene_feature_csv": str(gene_feature_csv),
