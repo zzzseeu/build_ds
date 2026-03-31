@@ -4,6 +4,5 @@ variant_effect_file: /path/to/all_site_variant_effect_by_site.csv
 sample_name: sample_1
 outdir: /path/to/simulated_combination_outputs
 model_file: /path/to/model.pkl
-rank_sample: sample_1_sim_000001
 rank_order: desc
 log_level: INFO

@@ -11,8 +11,9 @@ Inputs:
    - first column ``Chromosome``
    - second column ``Position``
 3. Variant-effect CSV:
-   - either ``site_id,var_effect``
-   - or ``Chromosome,Position,var_effect``
+   - first column ``Chromosome``
+   - second column ``Position``
+   - last column ``variant_effect``
 
 For each mutable site, the script enumerates the two genotype values different
 from the original genotype. If the original genotype is 0, the mutated values
@@ -27,6 +28,7 @@ import csv
 import json
 import math
 import pickle
+import re
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
@@ -37,6 +39,7 @@ from utils import get_logger
 
 LOGGER = None
 VALID_GENOTYPES = {0, 1, 2}
+SITE_ID_PATTERN = re.compile(r"^Chr\d+:\d+$")
 
 
 @dataclass(frozen=True)
@@ -330,6 +333,13 @@ def load_single_sample_genotype(genotype_file: str, sample_name: str | None) -> 
     site_columns = [column for column in target_row.keys() if column != "sample"]
     if not site_columns:
         raise ValueError("Genotype file does not contain any site columns")
+    invalid_site_columns = [column for column in site_columns if SITE_ID_PATTERN.fullmatch(str(column)) is None]
+    if invalid_site_columns:
+        raise ValueError(
+            "Genotype feature columns must use the format 'ChrN:Pos'. Invalid columns: "
+            + ",".join(invalid_site_columns[:20])
+            + ("..." if len(invalid_site_columns) > 20 else "")
+        )
 
     genotype_map: dict[str, int] = {}
     for site_id in site_columns:
@@ -359,10 +369,9 @@ def load_mutable_sites(mutable_sites_file: str) -> list[MutableSite]:
     rows = load_csv_rows(path)
     if not rows:
         raise ValueError(f"Mutable-site file is empty: {path}")
-    required = {"Chromosome", "Position"}
-    missing = required - set(rows[0].keys())
-    if missing:
-        raise ValueError(f"Mutable-site file must contain columns: {sorted(required)}")
+    header = list(rows[0].keys())
+    if len(header) < 2 or header[0] != "Chromosome" or header[1] != "Position":
+        raise ValueError("Mutable-site file first two columns must be: Chromosome, Position")
 
     sites: list[MutableSite] = []
     seen: set[str] = set()
@@ -395,20 +404,20 @@ def load_variant_effects(variant_effect_file: str, site_columns: Sequence[str]) 
     if not rows:
         raise ValueError(f"Variant-effect file is empty: {path}")
 
-    effect_map: dict[str, float] = {}
-    columns = set(rows[0].keys())
-    if {"site_id", "var_effect"}.issubset(columns):
-        for row in rows:
-            effect_map[str(row["site_id"]).strip()] = float(str(row["var_effect"]).strip())
-    elif {"Chromosome", "Position", "var_effect"}.issubset(columns):
-        for row in rows:
-            site_id = f"{str(row['Chromosome']).strip()}:{int(str(row['Position']).strip())}"
-            effect_map[site_id] = float(str(row["var_effect"]).strip())
-    else:
+    header = list(rows[0].keys())
+    if len(header) < 3:
         raise ValueError(
-            "Variant-effect file must contain either columns [site_id, var_effect] "
-            "or [Chromosome, Position, var_effect]"
+            "Variant-effect file must contain at least three columns: Chromosome, Position, ..., variant_effect"
         )
+    if header[0] != "Chromosome" or header[1] != "Position" or header[-1] != "variant_effect":
+        raise ValueError(
+            "Variant-effect file format must be: first column Chromosome, second column Position, last column variant_effect"
+        )
+
+    effect_map: dict[str, float] = {}
+    for row in rows:
+        site_id = f"{str(row['Chromosome']).strip()}:{int(str(row['Position']).strip())}"
+        effect_map[site_id] = float(str(row["variant_effect"]).strip())
 
     missing_effects = [site_id for site_id in site_columns if site_id not in effect_map]
     if missing_effects:
@@ -423,6 +432,21 @@ def load_variant_effects(variant_effect_file: str, site_columns: Sequence[str]) 
 
 def alternative_genotypes(original: int) -> list[int]:
     return [value for value in sorted(VALID_GENOTYPES) if value != original]
+
+
+def build_sample_rows(
+    sample_id: str,
+    site_columns: Sequence[str],
+    genotype_map: dict[str, int],
+    effect_map: dict[str, float],
+) -> tuple[dict[str, object], dict[str, object]]:
+    genotype_row: dict[str, object] = {"sample": sample_id}
+    weighted_row: dict[str, object] = {"sample": sample_id}
+    for site_id in site_columns:
+        genotype_value = int(genotype_map[site_id])
+        genotype_row[site_id] = genotype_value
+        weighted_row[site_id] = float(genotype_value) * float(effect_map[site_id])
+    return genotype_row, weighted_row
 
 
 def build_simulated_rows(
@@ -454,12 +478,12 @@ def build_simulated_rows(
             simulated_genotypes[site_id] = int(new_value)
             mutation_desc_parts.append(f"{site_id}:{old_value}>{new_value}")
 
-        genotype_row: dict[str, object] = {"sample": sample_id}
-        weighted_row: dict[str, object] = {"sample": sample_id}
-        for site_id in site_columns:
-            genotype_value = int(simulated_genotypes[site_id])
-            genotype_row[site_id] = genotype_value
-            weighted_row[site_id] = float(genotype_value) * float(effect_map[site_id])
+        genotype_row, weighted_row = build_sample_rows(
+            sample_id=sample_id,
+            site_columns=site_columns,
+            genotype_map=simulated_genotypes,
+            effect_map=effect_map,
+        )
         genotype_rows.append(genotype_row)
         weighted_rows.append(weighted_row)
         metadata_rows.append(
@@ -587,7 +611,6 @@ def main() -> None:
     outdir = Path(str(config.get("outdir", "simulated_combination_outputs")))
     sample_name = config.get("sample_name")
     model_file = config.get("model_file")
-    rank_sample = config.get("rank_sample")
     rank_order = str(config.get("rank_order", "desc")).lower()
     log_level = str(config.get("log_level", "INFO")).upper()
 
@@ -623,21 +646,28 @@ def main() -> None:
     )
 
     if model_file not in {None, ""}:
-        if rank_sample in {None, ""}:
-            raise ValueError("rank_sample is required in config when model_file is provided")
+        original_genotype_row, original_weighted_row = build_sample_rows(
+            sample_id=original_sample,
+            site_columns=site_columns,
+            genotype_map=genotype_map,
+            effect_map=effect_map,
+        )
+        prediction_weighted_rows = [original_weighted_row] + weighted_rows
         model = load_model(str(model_file))
-        predictions = predict_rows(model, weighted_rows, site_columns)
+        predictions = predict_rows(model, prediction_weighted_rows, site_columns)
         ranking_rows = rank_predictions(
-            weighted_rows=weighted_rows,
+            weighted_rows=prediction_weighted_rows,
             predictions=predictions,
-            rank_sample=str(rank_sample),
+            rank_sample=original_sample,
             descending=(rank_order == "desc"),
         )
         summary["prediction"] = save_prediction_outputs(
             outdir=outdir,
             ranking_rows=ranking_rows,
-            rank_sample=str(rank_sample),
+            rank_sample=original_sample,
         )
+        summary["prediction"]["rank_target"] = "original_sample"
+        summary["prediction"]["original_sample_included"] = True
 
     write_summary_json(summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
