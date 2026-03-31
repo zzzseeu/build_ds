@@ -24,6 +24,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
+import pickle
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
@@ -75,6 +77,168 @@ def maybe_write_parquet(rows: list[dict[str, object]], path: Path) -> bool:
     except Exception as exc:
         LOGGER.warning("Failed to write parquet %s: %s", path, exc)
         return False
+
+
+def load_model(model_file: str):
+    path = Path(model_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Model file not found: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix in {".joblib", ".jl"}:
+        try:
+            import joblib  # type: ignore
+        except Exception as exc:
+            raise ImportError("joblib is required to load .joblib model files") from exc
+        model_obj = joblib.load(path)
+    else:
+        with path.open("rb") as handle:
+            model_obj = pickle.load(handle)
+
+    if hasattr(model_obj, "predict"):
+        return model_obj
+    if isinstance(model_obj, dict):
+        if "model" in model_obj and hasattr(model_obj["model"], "predict"):
+            return model_obj["model"]
+        if "predictor" in model_obj and hasattr(model_obj["predictor"], "predict"):
+            return model_obj["predictor"]
+    raise ValueError(f"Unsupported model object in file: {path}")
+
+
+def get_model_feature_order(model, site_columns: Sequence[str]) -> list[str]:
+    feature_names = getattr(model, "feature_names_in_", None)
+    if feature_names is None:
+        return list(site_columns)
+    return [str(name) for name in feature_names]
+
+
+def predict_rows(model, weighted_rows: list[dict[str, object]], site_columns: Sequence[str]) -> list[float]:
+    feature_order = get_model_feature_order(model, site_columns)
+    missing = [feature for feature in feature_order if feature not in site_columns]
+    if missing:
+        raise ValueError(
+            "Model expects features missing from simulated matrix: "
+            + ",".join(missing[:20])
+            + ("..." if len(missing) > 20 else "")
+        )
+
+    matrix = [[float(row[feature]) for feature in feature_order] for row in weighted_rows]
+    try:
+        predictions = model.predict(matrix)
+    except Exception as exc:
+        raise RuntimeError(f"Model prediction failed: {exc}") from exc
+    return [float(value) for value in predictions]
+
+
+def rank_predictions(
+    weighted_rows: list[dict[str, object]],
+    predictions: list[float],
+    rank_sample: str,
+    descending: bool = True,
+) -> list[dict[str, object]]:
+    prediction_rows = [
+        {
+            "sample": str(row["sample"]),
+            "predicted_phenotype": float(pred),
+        }
+        for row, pred in zip(weighted_rows, predictions)
+    ]
+    prediction_rows.sort(key=lambda row: row["predicted_phenotype"], reverse=descending)
+    for rank, row in enumerate(prediction_rows, start=1):
+        row["rank"] = rank
+        row["is_target"] = row["sample"] == rank_sample
+
+    matched = [row for row in prediction_rows if row["sample"] == rank_sample]
+    if not matched:
+        raise ValueError(f"Rank sample '{rank_sample}' not found in simulated samples")
+    return prediction_rows
+
+
+def _scale_value(value: float, src_min: float, src_max: float, dst_min: float, dst_max: float) -> float:
+    if math.isclose(src_min, src_max):
+        return (dst_min + dst_max) / 2.0
+    ratio = (value - src_min) / (src_max - src_min)
+    return dst_min + ratio * (dst_max - dst_min)
+
+
+def write_rank_scatter_svg(
+    ranking_rows: list[dict[str, object]],
+    target_sample: str,
+    output_path: Path,
+) -> None:
+    width = 1200
+    height = 700
+    left = 90
+    right = 40
+    top = 40
+    bottom = 80
+    plot_width = width - left - right
+    plot_height = height - top - bottom
+
+    ranks = [int(row["rank"]) for row in ranking_rows]
+    values = [float(row["predicted_phenotype"]) for row in ranking_rows]
+    min_rank = min(ranks)
+    max_rank = max(ranks)
+    min_value = min(values)
+    max_value = max(values)
+
+    points: list[str] = []
+    target_label = ""
+    for row in ranking_rows:
+        x = _scale_value(float(row["rank"]), float(min_rank), float(max_rank), left, left + plot_width)
+        y = _scale_value(float(row["predicted_phenotype"]), min_value, max_value, top + plot_height, top)
+        is_target = bool(row["is_target"])
+        color = "#d62728" if is_target else "#bdbdbd"
+        radius = 5 if is_target else 3
+        opacity = "1.0" if is_target else "0.75"
+        points.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{radius}" fill="{color}" fill-opacity="{opacity}" />')
+        if is_target:
+            label_y = max(20.0, y - 14.0)
+            target_label = (
+                f'<text x="{x + 8:.2f}" y="{label_y:.2f}" font-size="14" fill="#d62728">'
+                f'{row["sample"]} (rank={row["rank"]}, pred={row["predicted_phenotype"]:.6f})'
+                "</text>"
+                f'<line x1="{x:.2f}" y1="{y:.2f}" x2="{x + 6:.2f}" y2="{label_y - 5:.2f}" stroke="#d62728" stroke-width="1.5" />'
+            )
+
+    axis_lines = [
+        f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" y2="{top + plot_height}" stroke="#333" stroke-width="1.5" />',
+        f'<line x1="{left}" y1="{top}" x2="{left}" y2="{top + plot_height}" stroke="#333" stroke-width="1.5" />',
+    ]
+
+    x_ticks = []
+    tick_count = min(10, len(ranking_rows))
+    for i in range(tick_count):
+        tick_rank = 1 if tick_count == 1 else round(min_rank + i * (max_rank - min_rank) / (tick_count - 1))
+        x = _scale_value(float(tick_rank), float(min_rank), float(max_rank), left, left + plot_width)
+        x_ticks.append(f'<line x1="{x:.2f}" y1="{top + plot_height}" x2="{x:.2f}" y2="{top + plot_height + 6}" stroke="#333" />')
+        x_ticks.append(f'<text x="{x:.2f}" y="{top + plot_height + 24}" font-size="12" text-anchor="middle" fill="#333">{tick_rank}</text>')
+
+    y_ticks = []
+    for i in range(5):
+        tick_value = min_value if i == 0 else min_value + i * (max_value - min_value) / 4.0
+        y = _scale_value(tick_value, min_value, max_value, top + plot_height, top)
+        y_ticks.append(f'<line x1="{left - 6}" y1="{y:.2f}" x2="{left}" y2="{y:.2f}" stroke="#333" />')
+        y_ticks.append(f'<text x="{left - 10}" y="{y + 4:.2f}" font-size="12" text-anchor="end" fill="#333">{tick_value:.4f}</text>')
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">
+<rect width="100%" height="100%" fill="white" />
+<text x="{width / 2:.0f}" y="24" text-anchor="middle" font-size="20" fill="#222">Predicted Phenotype Ranking</text>
+<text x="{width / 2:.0f}" y="{height - 18}" text-anchor="middle" font-size="15" fill="#333">rank</text>
+<text x="24" y="{height / 2:.0f}" text-anchor="middle" font-size="15" fill="#333" transform="rotate(-90 24 {height / 2:.0f})">predicted phenotype</text>
+{''.join(axis_lines)}
+{''.join(x_ticks)}
+{''.join(y_ticks)}
+{''.join(points)}
+{target_label}
+<circle cx="{width - 170}" cy="44" r="4" fill="#bdbdbd" />
+<text x="{width - 160}" y="48" font-size="12" fill="#444">background samples</text>
+<circle cx="{width - 170}" cy="66" r="5" fill="#d62728" />
+<text x="{width - 160}" y="70" font-size="12" fill="#444">target sample: {target_sample}</text>
+</svg>
+"""
+    output_path.write_text(svg, encoding="utf-8")
+    LOGGER.info("Wrote ranking scatter SVG: %s", output_path)
 
 
 def load_single_sample_genotype(genotype_file: str, sample_name: str | None) -> tuple[str, list[str], dict[str, int]]:
@@ -289,6 +453,7 @@ def save_outputs(
         "total_sites": len(site_columns),
         "mutable_sites": len(mutable_sites),
         "simulated_samples": len(genotype_rows),
+        "summary_json": str(metadata_json),
         "files": {
             "simulated_genotype_csv": str(genotype_csv),
             "simulated_genotype_parquet": str(genotype_parquet) if genotype_parquet_ok else None,
@@ -300,6 +465,43 @@ def save_outputs(
     metadata_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     LOGGER.info("Wrote simulation summary: %s", metadata_json)
     return summary
+
+
+def write_summary_json(summary: dict[str, object]) -> None:
+    summary_path = Path(str(summary["summary_json"]))
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    LOGGER.info("Updated simulation summary: %s", summary_path)
+
+
+def save_prediction_outputs(
+    outdir: Path,
+    ranking_rows: list[dict[str, object]],
+    rank_sample: str,
+) -> dict[str, object]:
+    prediction_csv = outdir / "simulated_prediction_ranking.csv"
+    prediction_parquet = outdir / "simulated_prediction_ranking.parquet"
+    scatter_svg = outdir / "simulated_prediction_ranking.svg"
+
+    fields = ["sample", "predicted_phenotype", "rank", "is_target"]
+    write_csv(ranking_rows, prediction_csv, fields)
+    prediction_parquet_ok = maybe_write_parquet(ranking_rows, prediction_parquet)
+    write_rank_scatter_svg(ranking_rows, rank_sample, scatter_svg)
+
+    target_row = next(row for row in ranking_rows if bool(row["is_target"]))
+    LOGGER.info(
+        "Saved prediction ranking: sample=%s rank=%s predicted_phenotype=%.6f",
+        rank_sample,
+        target_row["rank"],
+        float(target_row["predicted_phenotype"]),
+    )
+    return {
+        "prediction_ranking_csv": str(prediction_csv),
+        "prediction_ranking_parquet": str(prediction_parquet) if prediction_parquet_ok else None,
+        "prediction_ranking_svg": str(scatter_svg),
+        "target_sample": rank_sample,
+        "target_rank": int(target_row["rank"]),
+        "target_predicted_phenotype": float(target_row["predicted_phenotype"]),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -330,6 +532,22 @@ def parse_args() -> argparse.Namespace:
         "--outdir",
         default="simulated_combination_outputs",
         help="Output directory.",
+    )
+    parser.add_argument(
+        "--model-file",
+        default=None,
+        help="Optional phenotype prediction model file from model_train output.",
+    )
+    parser.add_argument(
+        "--rank-sample",
+        default=None,
+        help="Sample id to highlight in prediction ranking. Required when --model-file is provided.",
+    )
+    parser.add_argument(
+        "--rank-order",
+        default="desc",
+        choices=["desc", "asc"],
+        help="Sort direction for phenotype ranking. desc means larger predicted phenotype gets smaller rank.",
     )
     parser.add_argument(
         "--log-level",
@@ -370,6 +588,25 @@ def main() -> None:
         original_sample=original_sample,
         mutable_sites=mutable_sites,
     )
+
+    if args.model_file:
+        if not args.rank_sample:
+            raise ValueError("--rank-sample is required when --model-file is provided")
+        model = load_model(args.model_file)
+        predictions = predict_rows(model, weighted_rows, site_columns)
+        ranking_rows = rank_predictions(
+            weighted_rows=weighted_rows,
+            predictions=predictions,
+            rank_sample=args.rank_sample,
+            descending=(args.rank_order == "desc"),
+        )
+        summary["prediction"] = save_prediction_outputs(
+            outdir=outdir,
+            ranking_rows=ranking_rows,
+            rank_sample=args.rank_sample,
+        )
+
+    write_summary_json(summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 
