@@ -1,17 +1,17 @@
-tsv_path: /path/to/sites.tsv
-vcf_path: /path/to/variants.vcf.gz
-fasta_path: /path/to/genome.fa
-outdir: /path/to/variant_tsv_embedding_classifier_out
+tsv_path: uniontest_2.txt
+vcf_path: filtered.vcf.gz
+fasta_path: ../rawdata/msu.all.fasta
+outdir: ./embedding_anno_test
 
-k: 100
+k: 500
 
-embedder_type: rice8k
-model_name_or_path: /path/to/embedder_model
+embedder_type: agront
+model_name_or_path: InstaDeepAI/agro-nucleotide-transformer-1b
 device: cuda
 pooling: mean
 local_files_only: true
 
-task_type: auto
+task_type: binary
 feature_type: alt
 model_type: logistic_regression
 eval_mode: holdout
