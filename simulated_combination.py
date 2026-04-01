@@ -516,6 +516,7 @@ def _scale_value(value: float, src_min: float, src_max: float, dst_min: float, d
 def write_rank_scatter_svg(
     ranking_df: pd.DataFrame,
     target_sample: str,
+    location_label: str,
     output_path: Path,
 ) -> None:
     rows = ranking_df.to_dict(orient="records")
@@ -537,9 +538,11 @@ def write_rank_scatter_svg(
     max_value = max(values)
 
     points: list[str] = []
+    point_positions: list[tuple[float, float]] = []
     for row in rows:
         x = _scale_value(float(row["rank"]), float(min_rank), float(max_rank), left, left + plot_width)
         y = _scale_value(float(row["predicted_phenotype"]), min_value, max_value, top + plot_height, top)
+        point_positions.append((x, y))
         is_target = bool(row["is_target"])
         source_type = str(row.get("source_type", "simulated"))
         if is_target or source_type == "original":
@@ -567,31 +570,51 @@ def write_rank_scatter_svg(
         tick_rank = 1 if tick_count == 1 else round(min_rank + i * (max_rank - min_rank) / (tick_count - 1))
         x = _scale_value(float(tick_rank), float(min_rank), float(max_rank), left, left + plot_width)
         x_ticks.append(f'<line x1="{x:.2f}" y1="{top + plot_height}" x2="{x:.2f}" y2="{top + plot_height + 6}" stroke="#333" />')
-        x_ticks.append(f'<text x="{x:.2f}" y="{top + plot_height + 24}" font-size="12" text-anchor="middle" fill="#333">{tick_rank}</text>')
+        x_ticks.append(f'<text x="{x:.2f}" y="{top + plot_height + 28}" font-size="14" text-anchor="middle" fill="#333">{tick_rank}</text>')
 
     y_ticks = []
     for i in range(5):
         tick_value = min_value if i == 0 else min_value + i * (max_value - min_value) / 4.0
         y = _scale_value(tick_value, min_value, max_value, top + plot_height, top)
         y_ticks.append(f'<line x1="{left - 6}" y1="{y:.2f}" x2="{left}" y2="{y:.2f}" stroke="#333" />')
-        y_ticks.append(f'<text x="{left - 10}" y="{y + 4:.2f}" font-size="12" text-anchor="end" fill="#333">{tick_value:.4f}</text>')
+        y_ticks.append(f'<text x="{left - 10}" y="{y + 5:.2f}" font-size="14" text-anchor="end" fill="#333">{tick_value:.4f}</text>')
+
+    legend_width = 280
+    legend_height = 92
+    legend_candidates = [
+        ("top-right", left + plot_width - legend_width - 18, top + 18),
+        ("top-left", left + 18, top + 18),
+        ("bottom-right", left + plot_width - legend_width - 18, top + plot_height - legend_height - 18),
+        ("bottom-left", left + 18, top + plot_height - legend_height - 18),
+    ]
+    best_legend = legend_candidates[0]
+    best_overlap = None
+    for candidate in legend_candidates:
+        _, lx, ly = candidate
+        overlap = sum(1 for px, py in point_positions if lx <= px <= lx + legend_width and ly <= py <= ly + legend_height)
+        if best_overlap is None or overlap < best_overlap:
+            best_overlap = overlap
+            best_legend = candidate
+    _, legend_x, legend_y = best_legend
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">
 <rect width="100%" height="100%" fill="white" />
-<text x="{width / 2:.0f}" y="28" text-anchor="middle" font-size="24" fill="#222">Predicted Phenotype Ranking</text>
-<text x="{width / 2:.0f}" y="54" text-anchor="middle" font-size="16" fill="#555">original sample: {target_sample} | rank={target_row["rank"]} | pred={float(target_row["predicted_phenotype"]):.6f}</text>
-<text x="{width / 2:.0f}" y="{height - 18}" text-anchor="middle" font-size="15" fill="#333">rank</text>
-<text x="24" y="{height / 2:.0f}" text-anchor="middle" font-size="15" fill="#333" transform="rotate(-90 24 {height / 2:.0f})">predicted phenotype</text>
+<text x="{width / 2:.0f}" y="30" text-anchor="middle" font-size="30" font-weight="600" fill="#222">Predicted Phenotype Ranking</text>
+<text x="{width / 2:.0f}" y="60" text-anchor="middle" font-size="20" fill="#444">location: {location_label}</text>
+<text x="{width / 2:.0f}" y="86" text-anchor="middle" font-size="18" fill="#555">original sample: {target_sample} | rank={target_row["rank"]} | pred={float(target_row["predicted_phenotype"]):.6f}</text>
+<text x="{width / 2:.0f}" y="{height - 18}" text-anchor="middle" font-size="20" fill="#333">rank</text>
+<text x="28" y="{height / 2:.0f}" text-anchor="middle" font-size="20" fill="#333" transform="rotate(-90 28 {height / 2:.0f})">predicted phenotype</text>
 {''.join(axis_lines)}
 {''.join(x_ticks)}
 {''.join(y_ticks)}
 {''.join(points)}
-<circle cx="{width - 190}" cy="44" r="4" fill="#bdbdbd" />
-<text x="{width - 180}" y="48" font-size="12" fill="#444">simulated combinations</text>
-<circle cx="{width - 190}" cy="66" r="4" fill="#1f77b4" />
-<text x="{width - 180}" y="70" font-size="12" fill="#444">observed samples</text>
-<circle cx="{width - 190}" cy="88" r="5" fill="#d62728" />
-<text x="{width - 180}" y="92" font-size="12" fill="#444">original sample: {target_sample} (rank={target_row["rank"]})</text>
+<rect x="{legend_x:.2f}" y="{legend_y:.2f}" width="{legend_width}" height="{legend_height}" rx="10" ry="10" fill="white" fill-opacity="0.92" stroke="#d9d9d9" />
+<circle cx="{legend_x + 18:.2f}" cy="{legend_y + 22:.2f}" r="4" fill="#bdbdbd" />
+<text x="{legend_x + 32:.2f}" y="{legend_y + 27:.2f}" font-size="15" fill="#444">simulated combinations</text>
+<circle cx="{legend_x + 18:.2f}" cy="{legend_y + 46:.2f}" r="4" fill="#1f77b4" />
+<text x="{legend_x + 32:.2f}" y="{legend_y + 51:.2f}" font-size="15" fill="#444">observed samples</text>
+<circle cx="{legend_x + 18:.2f}" cy="{legend_y + 70:.2f}" r="5" fill="#d62728" />
+<text x="{legend_x + 32:.2f}" y="{legend_y + 75:.2f}" font-size="15" fill="#444">original sample: {target_sample} (rank={target_row["rank"]})</text>
 </svg>
 """
     output_path.write_text(svg, encoding="utf-8")
@@ -601,6 +624,7 @@ def write_rank_scatter_svg(
 def save_group_outputs(
     outdir: Path,
     group_id: str,
+    location_label: str,
     merged_group_df: pd.DataFrame,
     prediction_feature_df: pd.DataFrame,
     ranking_df: pd.DataFrame,
@@ -622,7 +646,7 @@ def save_group_outputs(
     prediction_feature_parquet_ok = maybe_write_parquet(prediction_feature_df, prediction_feature_parquet)
     ranking_df.to_csv(ranking_csv, index=False)
     ranking_parquet_ok = maybe_write_parquet(ranking_df, ranking_parquet)
-    write_rank_scatter_svg(ranking_df, target_sample, scatter_svg)
+    write_rank_scatter_svg(ranking_df, target_sample, location_label, scatter_svg)
 
     target_row = ranking_df[ranking_df["is_target"]].iloc[0]
     return {
@@ -748,6 +772,7 @@ def main() -> None:
         group_summary = save_group_outputs(
             outdir=group_outdir,
             group_id=group_id,
+            location_label=str(group["location_label"]),
             merged_group_df=group_df,
             prediction_feature_df=prediction_df,
             ranking_df=ranking_df,
