@@ -740,7 +740,7 @@ def main() -> None:
             simulated_feature_df=combined_feature_df,
             location_features=dict(group["location_features"]),
         )
-        prediction_df = prediction_df.loc[:, ["sample", "combination_id", "is_target", "source_sample"] + feature_columns_for_prediction]
+        prediction_df = prediction_df.loc[:, ["sample", "combination_id", "is_target", "source_sample", "source_type"] + feature_columns_for_prediction]
         predictions = predict_frame(model, prediction_df, feature_columns_for_prediction)
         ranking_df = rank_predictions(prediction_df, predictions, descending=descending)
 
