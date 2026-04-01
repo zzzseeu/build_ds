@@ -376,6 +376,7 @@ def build_combination_frame(
     weighted_matrix = np.empty((total_combinations, len(genotype_feature_columns)), dtype=np.float32)
     target_index = 0
     mutable_count = len(mutable_features)
+    mutable_genotype_matrix = np.empty((total_combinations, mutable_count), dtype=np.int8) if mutable_count else np.empty((total_combinations, 0), dtype=np.int8)
 
     for column_index, column in enumerate(genotype_feature_columns):
         effect = np.float32(effect_map[column])
@@ -384,6 +385,7 @@ def build_combination_frame(
             repeat_each = 3 ** (mutable_count - mutable_index - 1)
             tile_count = 3 ** mutable_index
             genotype_pattern = np.tile(np.repeat(np.asarray(VALID_GENOTYPES, dtype=np.int8), repeat_each), tile_count)
+            mutable_genotype_matrix[:, mutable_index] = genotype_pattern
             weighted_matrix[:, column_index] = genotype_pattern.astype(np.float32) * effect
             target_index += int(base_row[column]) * (3 ** (mutable_count - mutable_index - 1))
         else:
@@ -405,7 +407,35 @@ def build_combination_frame(
         "combination_id": combo_ids,
         "is_target": target_mask.astype(bool),
         "source_sample": [str(sample_id)] * total_combinations,
+        "source_type": ["simulated"] * total_combinations,
     })
+    feature_df.loc[target_mask, "source_type"] = "original"
+    if mutable_count:
+        base_mutable_values = np.asarray([int(base_row[feature]) for feature in mutable_features], dtype=np.int8)
+        mutated_feature_count = np.sum(mutable_genotype_matrix != base_mutable_values, axis=1).astype(int)
+        mutated_features = [
+            ";".join(
+                feature
+                for feature, value, base_value in zip(mutable_features, row_values, base_mutable_values)
+                if int(value) != int(base_value)
+            )
+            for row_values in mutable_genotype_matrix
+        ]
+        mutated_feature_genotypes = [
+            ";".join(
+                f"{feature}:{int(value)}"
+                for feature, value, base_value in zip(mutable_features, row_values, base_mutable_values)
+                if int(value) != int(base_value)
+            )
+            for row_values in mutable_genotype_matrix
+        ]
+    else:
+        mutated_feature_count = np.zeros(total_combinations, dtype=int)
+        mutated_features = [""] * total_combinations
+        mutated_feature_genotypes = [""] * total_combinations
+    feature_df["mutated_feature_count"] = mutated_feature_count
+    feature_df["mutated_features"] = mutated_features
+    feature_df["mutated_feature_genotypes"] = mutated_feature_genotypes
     genotype_feature_df = pd.DataFrame(weighted_matrix, columns=genotype_feature_columns, copy=False)
     feature_df = pd.concat([feature_df, genotype_feature_df], axis=1)
     return feature_df
@@ -421,16 +451,59 @@ def append_location_features(
     return prediction_df
 
 
+def build_observed_weighted_feature_frame(
+    genotype_df: pd.DataFrame,
+    genotype_feature_columns: Sequence[str],
+    effect_map: dict[str, float],
+    exclude_sample_id: str | None = None,
+) -> pd.DataFrame:
+    observed_df = genotype_df.copy()
+    if exclude_sample_id not in {None, ""}:
+        observed_df = observed_df[observed_df["sample"].astype(str) != str(exclude_sample_id)].copy()
+    observed_df = observed_df.reset_index(drop=True)
+    if observed_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "sample",
+                "combination_id",
+                "is_target",
+                "source_sample",
+                "source_type",
+                "mutated_feature_count",
+                "mutated_features",
+                "mutated_feature_genotypes",
+                *list(genotype_feature_columns),
+            ]
+        )
+
+    weighted_matrix = observed_df.loc[:, list(genotype_feature_columns)].to_numpy(dtype=np.float32, copy=True)
+    effect_vector = np.asarray([float(effect_map[column]) for column in genotype_feature_columns], dtype=np.float32)
+    weighted_matrix *= effect_vector
+
+    feature_df = pd.DataFrame({
+        "sample": observed_df["sample"].astype(str).tolist(),
+        "combination_id": [f"observed_{idx:06d}" for idx in range(len(observed_df))],
+        "is_target": [False] * len(observed_df),
+        "source_sample": observed_df["sample"].astype(str).tolist(),
+        "source_type": ["observed"] * len(observed_df),
+        "mutated_feature_count": [0] * len(observed_df),
+        "mutated_features": [""] * len(observed_df),
+        "mutated_feature_genotypes": [""] * len(observed_df),
+    })
+    weighted_feature_df = pd.DataFrame(weighted_matrix, columns=list(genotype_feature_columns), copy=False)
+    return pd.concat([feature_df, weighted_feature_df], axis=1)
+
+
 def rank_predictions(
     prediction_df: pd.DataFrame,
     predictions: np.ndarray,
     descending: bool,
 ) -> pd.DataFrame:
-    ranking_df = prediction_df.loc[:, ["sample", "combination_id", "is_target", "source_sample"]].copy()
+    ranking_df = prediction_df.loc[:, ["sample", "combination_id", "is_target", "source_sample", "source_type"]].copy()
     ranking_df["predicted_phenotype"] = np.asarray(predictions, dtype=float)
     ranking_df = ranking_df.sort_values("predicted_phenotype", ascending=not descending).reset_index(drop=True)
     ranking_df["rank"] = np.arange(1, len(ranking_df) + 1, dtype=int)
-    return ranking_df.loc[:, ["sample", "combination_id", "predicted_phenotype", "rank", "is_target", "source_sample"]]
+    return ranking_df.loc[:, ["sample", "combination_id", "predicted_phenotype", "rank", "is_target", "source_sample", "source_type"]]
 
 
 def _scale_value(value: float, src_min: float, src_max: float, dst_min: float, dst_max: float) -> float:
@@ -446,12 +519,13 @@ def write_rank_scatter_svg(
     output_path: Path,
 ) -> None:
     rows = ranking_df.to_dict(orient="records")
-    width = 1200
-    height = 700
+    target_row = next(row for row in rows if bool(row["is_target"]))
+    width = 1600
+    height = 920
     left = 90
-    right = 40
-    top = 40
-    bottom = 80
+    right = 80
+    top = 70
+    bottom = 90
     plot_width = width - left - right
     plot_height = height - top - bottom
 
@@ -463,23 +537,24 @@ def write_rank_scatter_svg(
     max_value = max(values)
 
     points: list[str] = []
-    target_label = ""
     for row in rows:
         x = _scale_value(float(row["rank"]), float(min_rank), float(max_rank), left, left + plot_width)
         y = _scale_value(float(row["predicted_phenotype"]), min_value, max_value, top + plot_height, top)
         is_target = bool(row["is_target"])
-        color = "#d62728" if is_target else "#bdbdbd"
-        radius = 5 if is_target else 3
-        opacity = "1.0" if is_target else "0.75"
+        source_type = str(row.get("source_type", "simulated"))
+        if is_target or source_type == "original":
+            color = "#d62728"
+            radius = 5
+            opacity = "1.0"
+        elif source_type == "observed":
+            color = "#1f77b4"
+            radius = 3.5
+            opacity = "0.85"
+        else:
+            color = "#bdbdbd"
+            radius = 3
+            opacity = "0.75"
         points.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{radius}" fill="{color}" fill-opacity="{opacity}" />')
-        if is_target:
-            label_y = max(20.0, y - 14.0)
-            target_label = (
-                f'<text x="{x + 8:.2f}" y="{label_y:.2f}" font-size="14" fill="#d62728">'
-                f'{target_sample} (rank={row["rank"]}, pred={row["predicted_phenotype"]:.6f})'
-                "</text>"
-                f'<line x1="{x:.2f}" y1="{y:.2f}" x2="{x + 6:.2f}" y2="{label_y - 5:.2f}" stroke="#d62728" stroke-width="1.5" />'
-            )
 
     axis_lines = [
         f'<line x1="{left}" y1="{top + plot_height}" x2="{left + plot_width}" y2="{top + plot_height}" stroke="#333" stroke-width="1.5" />',
@@ -503,18 +578,20 @@ def write_rank_scatter_svg(
 
     svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">
 <rect width="100%" height="100%" fill="white" />
-<text x="{width / 2:.0f}" y="24" text-anchor="middle" font-size="20" fill="#222">Predicted Phenotype Ranking</text>
+<text x="{width / 2:.0f}" y="28" text-anchor="middle" font-size="24" fill="#222">Predicted Phenotype Ranking</text>
+<text x="{width / 2:.0f}" y="54" text-anchor="middle" font-size="16" fill="#555">original sample: {target_sample} | rank={target_row["rank"]} | pred={float(target_row["predicted_phenotype"]):.6f}</text>
 <text x="{width / 2:.0f}" y="{height - 18}" text-anchor="middle" font-size="15" fill="#333">rank</text>
 <text x="24" y="{height / 2:.0f}" text-anchor="middle" font-size="15" fill="#333" transform="rotate(-90 24 {height / 2:.0f})">predicted phenotype</text>
 {''.join(axis_lines)}
 {''.join(x_ticks)}
 {''.join(y_ticks)}
 {''.join(points)}
-{target_label}
-<circle cx="{width - 170}" cy="44" r="4" fill="#bdbdbd" />
-<text x="{width - 160}" y="48" font-size="12" fill="#444">background combinations</text>
-<circle cx="{width - 170}" cy="66" r="5" fill="#d62728" />
-<text x="{width - 160}" y="70" font-size="12" fill="#444">target sample: {target_sample}</text>
+<circle cx="{width - 190}" cy="44" r="4" fill="#bdbdbd" />
+<text x="{width - 180}" y="48" font-size="12" fill="#444">simulated combinations</text>
+<circle cx="{width - 190}" cy="66" r="4" fill="#1f77b4" />
+<text x="{width - 180}" y="70" font-size="12" fill="#444">observed samples</text>
+<circle cx="{width - 190}" cy="88" r="5" fill="#d62728" />
+<text x="{width - 180}" y="92" font-size="12" fill="#444">original sample: {target_sample} (rank={target_row["rank"]})</text>
 </svg>
 """
     output_path.write_text(svg, encoding="utf-8")
@@ -623,6 +700,10 @@ def main() -> None:
     merged_sample_parquet = outdir / "merged_pheno_geno_filtered.parquet"
     simulated_feature_csv = outdir / "simulated_weighted_features.csv"
     simulated_feature_parquet = outdir / "simulated_weighted_features.parquet"
+    observed_feature_csv = outdir / "observed_weighted_features.csv"
+    observed_feature_parquet = outdir / "observed_weighted_features.parquet"
+    combined_feature_csv = outdir / "combined_weighted_features.csv"
+    combined_feature_parquet = outdir / "combined_weighted_features.parquet"
     merged_sample_df.to_csv(merged_sample_csv, index=False)
     merged_sample_parquet_ok = maybe_write_parquet(merged_sample_df, merged_sample_parquet)
 
@@ -638,14 +719,25 @@ def main() -> None:
         mutable_features=mutable_features,
         effect_map=effect_map,
     )
+    observed_feature_df = build_observed_weighted_feature_frame(
+        genotype_df=genotype_df,
+        genotype_feature_columns=genotype_feature_columns,
+        effect_map=effect_map,
+        exclude_sample_id=sample_id,
+    )
+    combined_feature_df = pd.concat([simulated_feature_df, observed_feature_df], ignore_index=True)
     simulated_feature_df.to_csv(simulated_feature_csv, index=False)
     simulated_feature_parquet_ok = maybe_write_parquet(simulated_feature_df, simulated_feature_parquet)
+    observed_feature_df.to_csv(observed_feature_csv, index=False)
+    observed_feature_parquet_ok = maybe_write_parquet(observed_feature_df, observed_feature_parquet)
+    combined_feature_df.to_csv(combined_feature_csv, index=False)
+    combined_feature_parquet_ok = maybe_write_parquet(combined_feature_df, combined_feature_parquet)
 
     for group in location_groups:
         group_id = str(group["group_id"])
         group_df = pd.DataFrame(group["group_df"])
         prediction_df = append_location_features(
-            simulated_feature_df=simulated_feature_df,
+            simulated_feature_df=combined_feature_df,
             location_features=dict(group["location_features"]),
         )
         prediction_df = prediction_df.loc[:, ["sample", "combination_id", "is_target", "source_sample"] + feature_columns_for_prediction]
@@ -676,11 +768,17 @@ def main() -> None:
         "mutable_feature_count": len(mutable_features),
         "mutable_features": mutable_features,
         "combinations_per_group": int(total_combinations),
+        "observed_samples_added": int(len(observed_feature_df)),
+        "prediction_rows_per_group": int(len(combined_feature_df)),
         "files": {
             "merged_pheno_geno_filtered_csv": str(merged_sample_csv),
             "merged_pheno_geno_filtered_parquet": str(merged_sample_parquet) if merged_sample_parquet_ok else None,
             "simulated_feature_csv": str(simulated_feature_csv),
             "simulated_feature_parquet": str(simulated_feature_parquet) if simulated_feature_parquet_ok else None,
+            "observed_feature_csv": str(observed_feature_csv),
+            "observed_feature_parquet": str(observed_feature_parquet) if observed_feature_parquet_ok else None,
+            "combined_feature_csv": str(combined_feature_csv),
+            "combined_feature_parquet": str(combined_feature_parquet) if combined_feature_parquet_ok else None,
         },
         "prediction": {
             "mode": "grouped_by_location",
